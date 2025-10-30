@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gamma Chart</title>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <style>
+        body { font-family: sans-serif; background-color: #f9f9f9; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 1rem; }
+        .controls { display: flex; gap: 1rem; margin-bottom: 1rem; }
+        #ticker { flex-basis: 150px; padding: 8px; }
+        #interval { flex-basis: 100px; padding: 8px; }
+        #chart { width: 100%; height: 75vh; }
+        #loading { text-align: center; font-size: 1.2rem; display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Intraday Gamma Exposure</h1>
+        <div class="controls">
+            <input id="ticker" type="text" value="SPY">
+            <select id="interval">
+                <option value="1m">1m</option>
+                <option value="2m">2m</option>
+                <option value="5m" selected>5m</option>
+                <option value="15m">15m</option>
+                <option value="30m">30m</option>
+            </select>
+        </div>
+        <div id="chart"></div>
+        <div id="loading">Loading chart data...</div>
+    </div>
+
+    <script>
+        // Get references to our UI elements
+        const tickerInput = document.getElementById('ticker');
+        const intervalSelect = document.getElementById('interval');
+        const chartDiv = document.getElementById('chart');
+        const loadingDiv = document.getElementById('loading');
+
+        // Main function to fetch data and plot the chart
+        async function mainFetchAndPlot() {
+            const ticker = tickerInput.value || 'SPY';
+            const interval = intervalSelect.value;
+            
+            setLoading(true);
+
+            try {
+                // We will fetch both API endpoints at the same time
+                const [gammaRes, ohlcRes] = await Promise.all([
+                    fetch(`/api/get-gamma?ticker=${ticker}`),
+                    fetch(`/api/get-ohlc?ticker=${ticker}&interval=${interval}`)
+                ]);
+
+                if (!gammaRes.ok || !ohlcRes.ok) {
+                    throw new Error('Failed to fetch data from API');
+                }
+
+                const gammaData = await gammaRes.json();
+                const ohlcData = await ohlcRes.json();
+
+                // Now, plot the combined chart
+                plotCombinedChart(gammaData, ohlcData);
+
+            } catch (error) {
+                console.error('Error fetching or plotting chart:', error);
+                chartDiv.innerHTML = `<p>Error loading chart: ${error.message}</p>`;
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        // This function replaces your 'combineFigs' logic
+        function plotCombinedChart(gammaData, ohlcData) {
+            // gammaData will be: { heatmapTrace: {...}, limits: {up, down}, mteList: [...] }
+            // ohlcData will be: { ohlcTrace: {...}, mktHoursRange: [max, 0] }
+
+            const heatmapTrace = gammaData.heatmapTrace;
+            const ohlcTrace = ohlcData.ohlcTrace;
+            
+            const data = [heatmapTrace, ohlcTrace];
+
+            const layout = {
+                title: `${tickerInput.value.toUpperCase()} Gamma Exposure`,
+                xaxis: {
+                    title: "mte",
+                    range: [gammaData.mteList[gammaData.mteList.length - 1], gammaData.mteList[0]], // Reversed
+                    rangeslider: { visible: false }
+                },
+                yaxis: {
+                    title: "strike",
+                    range: [gammaData.limits.down, gammaData.limits.up]
+                },
+                // This is the second x-axis for the candlestick chart
+                xaxis2: {
+                    overlaying: 'x',
+                    range: ohlcData.mktHoursRange,
+                    rangeslider: { visible: false },
+                    anchor: 'y',
+                    showgrid: false,
+                    showticklabels: false
+                },
+                // Replicates uirevision to keep zoom on refresh
+                uirevision: tickerInput.value,
+                margin: { l: 50, r: 10, b: 50, t: 50 }
+            };
+
+            Plotly.newPlot(chartDiv, data, layout, { displaylogo: false });
+        }
+
+        function setLoading(isLoading) {
+            loadingDiv.style.display = isLoading ? 'block' : 'none';
+            chartDiv.style.display = isLoading ? 'none' : 'block';
+        }
+
+        // --- Event Listeners ---
+
+        // Add listeners for the input and dropdown
+        // (We use 'change' instead of 'debounce')
+        tickerInput.addEventListener('change', mainFetchAndPlot);
+        intervalSelect.addEventListener('change', mainFetchAndPlot);
+
+        // Run once on page load
+        document.addEventListener('DOMContentLoaded', mainFetchAndPlot);
+
+        // TODO: Re-implement the timers (dcc.Interval)
+        // setInterval(mainFetchAndPlot, 10 * 60 * 1000); // 10 minutes for map
+        // setInterval(mainFetchAndPlot, 2.5 * 60 * 1000); // 2.5 minutes for CS
+    </script>
+</body>
+</html>
