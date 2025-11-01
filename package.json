@@ -1,5 +1,14 @@
 {
+  "name": "gamma-heatmap-pages",
+  "version": "1.0.0",
+
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20251014.0"
+    "@cloudflare/workers-types": "^4.20251014.0",
+    "esbuild": "^0.25.11"
+  },
+  
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --outfile=public/_worker.js --format=esm --sourcemap",
+    "dev": "npm run build && wrangler pages dev public"
   }
 }

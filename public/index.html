@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gamma Chart</title>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <style>
+        /* ... your existing styles ... */
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Intraday Gamma Exposure</h1>
+        <div class="controls">
+            <input id="ticker" type="text" value="SPY">
+            <select id="interval">
+                <option value="1m">1m</option>
+                <option value="2m">2m</option>
+                <option value="5m" selected>5m</option>
+                <option value="15m">15m</option>
+                <option value="30m">30m</option>
+            </select>
+        </div>
+        <div id="chart"></div>
+        <div id="loading">Loading chart data...</div>
+    </div>
+
+    <script>
+        const tickerInput = document.getElementById('ticker');
+        const intervalSelect = document.getElementById('interval');
+        const chartDiv = document.getElementById('chart');
+        const loadingDiv = document.getElementById('loading');
+
+        // --- State Management ---
+        // We store the latest data from each API call
+        let latestGammaData = null;
+        let latestOhlcData = null;
+        let gammaTimer = null;
+        let ohlcTimer = null;
+
+        // --- Plotting Function ---
+        function plotCombinedChart() {
+            // Wait until both datasets are loaded
+            if (!latestGammaData || !latestOhlcData) {
+                console.log('Waiting for both datasets to load...');
+                return;
+            }
+            
+            setLoading(false);
+
+            const data = [
+                latestGammaData.heatmapTrace, 
+                latestOhlcData.ohlcTrace
+            ];
+
+            const layout = {
+                title: `${tickerInput.value.toUpperCase()} Gamma Exposure (Spot: ${latestGammaData.spot})`,
+                xaxis: {
+                    title: "mte",
+                    // Use the mteList from the gamma data
+                    range: [latestGammaData.mteList[latestGammaData.mteList.length - 1], latestGammaData.mteList[0]],
+                    rangeslider: { visible: false }
+                },
+                yaxis: {
+                    title: "strike",
+                    // Use the limits from the gamma data
+                    range: [latestGammaData.limits.down, latestGammaData.limits.up]
+                },
+                xaxis2: {
+                    overlaying: 'x',
+                    range: latestOhlcData.mktHoursRange,
+                    rangeslider: { visible: false },
+                    anchor: 'y',
+                    showgrid: false,
+                    showticklabels: false
+                },
+                uirevision: tickerInput.value,
+                margin: { l: 50, r: 10, b: 50, t: 50 }
+            };
+
+            Plotly.react(chartDiv, data, layout, { displaylogo: false });
+        }
+
+        async function fetchGamma() {
+            const ticker = tickerInput.value || 'SPY';
+            try {
+                // This path is correct, it will be caught by our _worker.ts router
+                const res = await fetch(`/api/get-gamma-api?ticker=${ticker}`);
+                
+                // Safety check: make sure response is OK and is JSON
+                const contentType = res.headers.get("content-type");
+                if (res.ok && contentType && contentType.includes("application/json")) {
+                    latestGammaData = await res.json();
+                } else {
+                    // This will catch the "No data available" 404
+                    const errorJson = await res.json();
+                    throw new Error(errorJson.error || 'Failed to load gamma data');
+                }
+                
+                plotCombinedChart();
+            } catch (error) {
+                console.error('Error fetching gamma:', error);
+                // This will now show the *real* error, like "No data available"
+                chartDiv.innerHTML = `<p>Error loading gamma: ${error.message}</p>`;
+                setLoading(false);
+            }
+        }
+
+        async function fetchOhlc() {
+            const ticker = tickerInput.value || 'SPY';
+            const interval = intervalSelect.value;
+            try {
+                const res = await fetch(`/api/get-ohlc?ticker=${ticker}&interval=${interval}`);
+                if (!res.ok) throw new Error('Failed to fetch OHLC data');
+                
+                latestOhlcData = await res.json();
+                plotCombinedChart(); // Attempt to plot
+            } catch (error) {
+                console.error('Error fetching OHLC:', error);
+            }
+        }
+
+        function setLoading(isLoading) {
+            loadingDiv.style.display = isLoading ? 'block' : 'none';
+            chartDiv.style.display = isLoading ? 'none' : 'block';
+        }
+        
+        // --- Main function to start everything ---
+        function startApp() {
+            console.log('Starting app...');
+            setLoading(true);
+            
+            // Clear any existing timers
+            if (gammaTimer) clearInterval(gammaTimer);
+            if (ohlcTimer) clearInterval(ohlcTimer);
+
+            // Fetch initial data
+            fetchGamma();
+            fetchOhlc();
+
+            // Start new timers
+            // 1 minute for Gamma
+            gammaTimer = setInterval(fetchGamma, 60 * 1000); 
+            // 10 seconds for OHLC
+            ohlcTimer = setInterval(fetchOhlc, 10 * 1000); 
+        }
+
+        // --- Event Listeners ---
+        tickerInput.addEventListener('change', startApp);
+        intervalSelect.addEventListener('change', startApp);
+        document.addEventListener('DOMContentLoaded', startApp);
+
+    </script>
+</body>
+</html>
