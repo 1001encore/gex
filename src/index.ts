@@ -1,4 +1,4 @@
-// functions/_worker.ts
+// src/index.ts
 
 /// <reference types="@cloudflare/workers-types" />
 
@@ -10,159 +10,261 @@ import {
   DurableObject,
 } from '@cloudflare/workers-types';
 
-// Import ALL our logic from the one _lib.ts file
+// 1. IMPORT PATH FIXED (and new helpers)
 import {
   calc_gamma,
   getMteList,
   getMarketStatus,
   getChartLimits,
   makeCS,
-} from './lib'; // <-- THIS IS THE CORRECT PATH
+  getStorageKey, // <-- NEW
+  getDateStr,   // <-- NEW
+} from './lib';
 import type { GammaDf } from './lib';
 
-// --- 1. DEFINE AND EXPORT THE DURABLE OBJECT ---
-// We define the class right here in the main worker file
-// -----------------------------------------------------------------
+// --- CONSTANTS ---
+const APP_TIMEZONE = 'Asia/Istanbul';
+const DAYS_OF_DATA_TO_KEEP = 3;
+const TICKER = 'SPY';
 
-export interface FinalPayload {
+// --- NEW TYPE DEFINITIONS ---
+// This is what we store for *each session*
+interface SessionData {
+  y_strikes: number[];
+  strips: number[][]; // An array of value arrays (z-strips)
+  mtes: number[];     // An array of mte values (x-axis)
+  limits: { up: number; down: number };
+  spot: number;
+
+  // --- ADD THESE TWO LINES ---
+  future_x_mte: number[];
+  future_z_values: number[][];
+}
+
+// This is what we send to the front-end
+interface FinalPayload {
   heatmapTrace: {
     type: 'heatmap';
-    x: number[];
-    y: number[];
-    z: number[][];
+    x: number[]; // All mtes combined
+    y: number[]; // All strikes
+    z: number[][]; // All strips combined
     colorscale: 'Edge';
     zmid: 0;
     zsmooth: 'best';
   };
   limits: { up: number; down: number };
-  mteList: number[];
   spot: number;
-  marketTime: string;
-  marketStatus: string;
-}
-interface HeatmapState {
-  y_strikes: number[];
-  locked_x_mte: number[];
-  locked_z_strips: number[][];
-  future_x_mte: number[];
-  future_z_values: number[][];
-  limits: { up: number; down: number };
-  spot: number;
-  marketStatus: string;
-}
-interface UpdateMapData {
-  futureMap: { x_mte: number[]; y_strikes: number[]; z_values: number[][] };
-  historicalStrip: { x_mte: number; z_strip: number[] };
-  limits: { up: number; down: number };
-  spot: number;
-  marketStatus: string;
+  sessionMarkers: { x: number, label: string }[]; // <-- NEW: for drawing lines
 }
 
-// This is the class wrangler needs to see exported
+// This is the data format from the scheduled function
+interface NewStripData {
+  historicalStrip: {
+    x_mte: number;
+    z_strip: number[];
+  };
+  futureMap: {
+    x_mte: number[];
+    y_strikes: number[];
+    z_values: number[][];
+  };
+  limits: { up: number; down: number };
+  spot: number;
+}
+
+
+// --- 1. THE REFACTORED DURABLE OBJECT ---
+// The DO is now a pure key-value storage manager.
+// -----------------------------------------------------------------
 export class HeatmapBuilderDO implements DurableObject {
   state: DurableObjectState;
+
   constructor(state: DurableObjectState) {
     this.state = state;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === 'POST' && url.pathname === '/updateMap') {
-      const data = (await request.json()) as UpdateMapData;
-      await this.updateMap(data);
+
+    // --- ROUTE A: Add a new data strip (called by cron) ---
+    if (request.method === 'POST' && url.pathname === '/api/v1/addStrip') {
+      const { key } = getStorageKey(APP_TIMEZONE);
+      const newData = (await request.json()) as NewStripData;
+
+      // Get existing data for this session, or create new
+      let sessionData: SessionData = (await this.state.storage.get(key)) || {
+        y_strikes: newData.futureMap.y_strikes,
+        strips: [],
+        mtes: [],
+        limits: newData.limits,
+        spot: newData.spot,
+        future_x_mte: [], // <-- Initialize new field
+        future_z_values: [] // <-- Initialize new field
+      };
+
+      // Append new strip
+      sessionData.strips.push(newData.historicalStrip.z_strip);
+      sessionData.mtes.push(newData.historicalStrip.x_mte);
+      
+      // --- UPDATE THESE LINES ---
+      // Update with latest "future" data, spot, and limits
+      sessionData.limits = newData.limits;
+      sessionData.spot = newData.spot;
+      sessionData.future_x_mte = newData.futureMap.x_mte;
+      sessionData.future_z_values = newData.futureMap.z_values;
+      // --------------------------
+
+      // Write back to the unique key
+      await this.state.storage.put(key, sessionData);
       return new Response('OK');
     }
-    if (request.method === 'GET' && url.pathname === '/getCombinedPayload') {
-      const payload = await this.getCombinedPayload();
-      if (payload) {
-        return new Response(JSON.stringify(payload), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } else {
+
+    // --- ROUTE B: Get combined data (called by front-end) ---
+    if (request.method === 'GET' && url.pathname === '/api/v1/getChartData') {
+      const startDate = getDateStr(DAYS_OF_DATA_TO_KEEP, APP_TIMEZONE);
+      
+      const keys = await this.state.storage.list<SessionData>({
+        prefix: `data_${TICKER}_`,
+        start: `data_${TICKER}_${startDate}`,
+      });
+
+      if (keys.size === 0) {
         return new Response(JSON.stringify({ error: 'No data available' }), {
           status: 404,
           headers: { 'Content-Type': 'application/json' },
         });
       }
-    }
-    return new Response('Not found', { status: 404 });
-  }
 
-  async updateMap(data: UpdateMapData) {
-    let currentState: HeatmapState = (await this.state.storage.get(
-      'heatmapState'
-    )) || {
-      y_strikes: data.futureMap.y_strikes,
-      locked_x_mte: [],
-      locked_z_strips: [],
-      future_x_mte: [],
-      future_z_values: [],
-      limits: data.limits,
-      spot: data.spot,
-      marketStatus: data.marketStatus,
-    };
-    currentState.future_x_mte = data.futureMap.x_mte;
-    currentState.future_z_values = data.futureMap.z_values;
-    currentState.locked_x_mte.push(data.historicalStrip.x_mte);
-    currentState.locked_z_strips.push(data.historicalStrip.z_strip);
-    currentState.limits = data.limits;
-    currentState.spot = data.spot;
-    currentState.marketStatus = data.marketStatus;
-    await this.state.storage.put('heatmapState', currentState);
-  }
+      // Stitch all session data together
+      const combined_x_mte: number[] = [];
+      const combined_z_values: number[][] = [];
+      const sessionMarkers: { x: number; label: string }[] = [];
+      let lastKnownSpot = 0;
+      let lastKnownLimits = { up: 0, down: 0 };
+      let y_strikes: number[] = [];
+      
+      // --- NEW: Need to track the latest session to get its future map ---
+      let latestSession: SessionData | null = null;
+      let lastKey = "";
 
-  async getCombinedPayload(): Promise<FinalPayload | null> {
-    const currentState: HeatmapState | undefined =
-      await this.state.storage.get('heatmapState');
-    if (!currentState) return null;
-    const combined_x_mte = [
-      ...[...currentState.locked_x_mte].reverse(),
-      ...currentState.future_x_mte,
-    ];
-    const numStrikes = currentState.y_strikes.length;
-    const numLockedStrips = currentState.locked_x_mte.length;
-    const combined_z_values: number[][] = [];
-    const reversedLockedStrips = [...currentState.locked_z_strips].reverse();
-    for (let i = 0; i < numStrikes; i++) {
-      const row: number[] = [];
-      for (let j = 0; j < numLockedStrips; j++) {
-        row.push(reversedLockedStrips[j][i] || 0);
+      for (const [key, sessionData] of keys) {
+        if (!sessionData || !sessionData.mtes || !sessionData.strips) continue;
+        
+        const sessionName = key.split('_').pop() || 'session'; 
+
+        if (combined_x_mte.length > 0 && !key.endsWith(lastKey.split('_').pop()!)) {
+            sessionMarkers.push({
+                x: combined_x_mte[combined_x_mte.length - 1], 
+                label: sessionName,
+            });
+        }
+        lastKey = key;
+
+        // Combine historical mtes (x-axis)
+        combined_x_mte.push(...[...sessionData.mtes].reverse());
+
+        // Combine historical strips (z-axis)
+        if (combined_z_values.length === 0) {
+            y_strikes = sessionData.y_strikes;
+            for (let i = 0; i < y_strikes.length; i++) {
+                combined_z_values.push([]);
+            }
+        }
+        
+        const reversedStrips = [...sessionData.strips].reverse();
+        for (let i = 0; i < y_strikes.length; i++) {
+            for (const strip of reversedStrips) {
+                combined_z_values[i].push(strip[i] || 0);
+            }
+        }
+        
+        // --- Store the *latest* session data ---
+        latestSession = sessionData;
       }
-      row.push(...(currentState.future_z_values[i] || []));
-      combined_z_values.push(row);
+      
+      // --- NEW: Append the latest "future" map ---
+      if (latestSession && latestSession.future_x_mte) {
+          // Add future x-axis values
+          combined_x_mte.push(...latestSession.future_x_mte);
+          
+          // Add future z-axis values
+          for (let i = 0; i < y_strikes.length; i++) {
+              combined_z_values[i].push(...(latestSession.future_z_values[i] || []));
+          }
+          
+          // Update spot/limits to the absolute latest
+          lastKnownSpot = latestSession.spot;
+          lastKnownLimits = latestSession.limits;
+      }
+      // ------------------------------------------
+
+      const payload: FinalPayload = {
+        heatmapTrace: {
+          type: 'heatmap',
+          x: combined_x_mte,
+          y: y_strikes,
+          z: combined_z_values,
+          colorscale: 'Edge',
+          zmid: 0,
+          zsmooth: 'best',
+        },
+        limits: lastKnownLimits,
+        spot: lastKnownSpot,
+        sessionMarkers: sessionMarkers,
+      };
+
+      return new Response(JSON.stringify(payload), {
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
-    return {
-      heatmapTrace: {
-        type: 'heatmap',
-        x: combined_x_mte,
-        y: currentState.y_strikes,
-        z: combined_z_values,
-        colorscale: 'Edge',
-        zmid: 0,
-        zsmooth: 'best',
-      },
-      limits: currentState.limits,
-      mteList: combined_x_mte,
-      spot: currentState.spot,
-      marketTime: new Date().toLocaleString('en-US', {
-        timeZone: 'Asia/Istanbul',
-      }),
-      marketStatus: currentState.marketStatus,
-    };
+
+    // --- ROUTE C: Increment Dev Time (FOR LOCAL TESTING) ---
+    if (request.method === 'POST' && url.pathname === '/api/v1/incrementDevTime') {
+        // Get the last time, or default to 10
+        let lastMins = await this.state.storage.get<number>('dev_mins_passed') || 10;
+        
+        // Increment by 1 minute
+        lastMins += 1; 
+
+        await this.state.storage.put('dev_mins_passed', lastMins);
+        return new Response(JSON.stringify(lastMins), {
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    // --- ROUTE D: Delete old data (called by cron) ---
+    if (request.method === 'POST' && url.pathname === '/api/v1/deleteOldData') {
+        const endDate = getDateStr(DAYS_OF_DATA_TO_KEEP + 1, APP_TIMEZONE);
+
+        // List all keys *up to* 4 days ago
+        const oldKeys = await this.state.storage.list({
+            prefix: `data_${TICKER}_`,
+            end: `data_${TICKER}_${endDate}T23:59:59Z`, // T23:59:59Z ensures we get the whole day
+        });
+
+        if (oldKeys.size > 0) {
+            await this.state.storage.delete(Array.from(oldKeys.keys()));
+            return new Response(`Deleted ${oldKeys.size} old keys.`);
+        }
+        return new Response('No old keys to delete.');
+    }
+
+    return new Response('Not found', { status: 404 });
   }
 }
 
-// --- 2. DEFINE THE ENVIRONMENT ---
+// --- 2. DEFINE THE WORKER ENVIRONMENT ---
 // -----------------------------------------------------------------
 export interface Env {
   GEX_HISTORY_DO: DurableObjectNamespace;
-  ASSETS: Fetcher; // <-- ADD THIS LINE
+  ASSETS: Fetcher;
 }
 
-// --- 3. MASTER HANDLER (fetch + scheduled) ---
+// --- 3. THE REFACTORED WORKER (fetch + scheduled) ---
+// -----------------------------------------------------------------
 export default {
   /**
-   * This is the main router for ALL requests.
+   * Main router for all requests.
    */
   async fetch(
     request: Request,
@@ -172,43 +274,26 @@ export default {
     const url = new URL(request.url);
 
     try {
-      // --- ROUTE 1: /api/get-gamma-api ---
+      // --- FRONT-END API: Get Chart Data ---
       if (url.pathname === '/api/get-gamma-api') {
-        const ticker = url.searchParams.get('ticker')?.toUpperCase() || 'SPY';
-        const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+        const doId = env.GEX_HISTORY_DO.idFromName(TICKER); // One DO per ticker
         const stub = env.GEX_HISTORY_DO.get(doId);
-
-        const resp = await stub.fetch('https://dummy/getCombinedPayload');
-        if (!resp.ok) {
-          return new Response(
-            JSON.stringify({
-              error:
-                'No heatmap data available yet. Please wait for the next cron run.',
-            }),
-            { status: 404, headers: { 'Content-Type': 'application/json' } }
-          );
-        }
-        const payload = (await resp.json()) as FinalPayload;
-        return new Response(JSON.stringify(payload), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Cache-Control': 's-maxage=10',
-          },
-        });
+        
+        // Forward the request to the DO's /api/v1/getChartData route
+        return await stub.fetch('https://dummy/api/v1/getChartData');
       }
 
-      // --- ROUTE 2: /api/get-ohlc ---
+      // --- FRONT-END API: Get OHLC Data ---
       if (url.pathname === '/api/get-ohlc') {
-        const ticker = url.searchParams.get('ticker')?.toUpperCase() || 'SPY';
+        // ... (This logic is unchanged and still correct)
+        const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
         const interval = url.searchParams.get('interval') || '5m';
-        const { mkt_hours } = getMarketStatus('Asia/Istanbul');
-
+        const { mkt_hours } = getMarketStatus(APP_TIMEZONE);
         const { ohlc, mktHoursRange } = await makeCS(
           ticker,
           interval,
           mkt_hours
         );
-
         const ohlcTrace = {
           type: 'candlestick',
           x: ohlc.x,
@@ -228,11 +313,8 @@ export default {
         });
       }
 
-      // --- 4. FALLBACK TO SERVE STATIC ASSETS ---
-      // This is the correct fallback.
-      // It serves your index.html and any other assets.
+      // --- Fallback: Serve Static Assets ---
       return env.ASSETS.fetch(request);
-
     } catch (error) {
       const err = error as Error;
       return new Response(
@@ -246,48 +328,78 @@ export default {
   },
 
   /**
-   * This is the cron job handler.
-   * (No changes needed, this is correct)
+   * Cron job handler.
    */
   async scheduled(
     controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    const ticker = 'SPY';
-    //console.log('--- RUNNING IN DEV MODE: FORCING MARKET OPEN ---');
-    //const { mkt_hours, mins_passed } = { mkt_hours: 'mkt_open', mins_passed: 10 };
-    const { mkt_hours, mins_passed } = getMarketStatus('Asia/Istanbul');
+    // --- 1. Perform Computation ---
+    // const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
+    //const { mkt_hours, mins_passed } = { mkt_hours: 'mkt_open', mins_passed: 30 };
+
+    // --- STATEFUL DEV-MODE HACK ---
+    // Get the DO stub
+    const doId_dev = env.GEX_HISTORY_DO.idFromName(TICKER);
+    const stub_dev = env.GEX_HISTORY_DO.get(doId_dev);
+    
+    // Call our new endpoint to get the *next* minute
+    const devTimeRes = await stub_dev.fetch('https://dummy/api/v1/incrementDevTime', {
+        method: 'POST',
+    });
+    const new_mins_passed = await devTimeRes.json() as number;
+    
+    console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${new_mins_passed}) ---`);
+    const { mkt_hours, mins_passed } = { mkt_hours: 'mkt_open', mins_passed: new_mins_passed };
+    // ----- DEV-MODE HACK END ------
+
+    // const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE); // Real code
     if (mkt_hours === 'mkt_closed') {
       console.log('Market closed, cron skipping.');
       return;
     }
+
     const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
-    const { df, spot } = await calc_gamma(ticker, mte_list);
+    const { df, spot } = await calc_gamma(TICKER, mte_list);
     const { limit_up, limit_down } = getChartLimits(df, mte_len);
-    const historicalStrip = {
-      x_mte: df.columns[0],
-      z_strip: df.values.map((row) => row[0]),
+
+    const stripData: NewStripData = {
+      historicalStrip: {
+        x_mte: df.columns[0],
+        z_strip: df.values.map((row) => row[0]),
+      },
+      futureMap: {
+        x_mte: df.columns.slice(1),
+        y_strikes: df.index,
+        z_values: df.values.map((row) => row.slice(1)),
+      },
+      limits: { up: limit_up, down: limit_down },
+      spot: spot,
     };
-    const futureMap = {
-      x_mte: df.columns.slice(1),
-      y_strikes: df.index,
-      z_values: df.values.map((row) => row.slice(1)),
-    };
-    const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+
+    // --- 2. Call DO to Store Data ---
+    const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
     const stub = env.GEX_HISTORY_DO.get(doId);
+    
     ctx.waitUntil(
-      stub.fetch('https://dummy/updateMap', {
+      stub.fetch('https://dummy/api/v1/addStrip', {
         method: 'POST',
-        body: JSON.stringify({
-          futureMap,
-          historicalStrip,
-          limits: { up: limit_up, down: limit_down },
-          spot: spot,
-          marketStatus: mkt_hours,
-        }),
+        body: JSON.stringify(stripData),
         headers: { 'Content-Type': 'application/json' },
       })
     );
+
+    // --- 3. Trigger Old Data Deletion (once per day) ---
+    // This runs just after midnight in the app's timezone.
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: APP_TIMEZONE }));
+    if (now.getHours() === 0 && now.getMinutes() < 5) { // Run between 00:00 and 00:05
+        console.log('Running daily cleanup of old DO keys...');
+        ctx.waitUntil(
+            stub.fetch('https://dummy/api/v1/deleteOldData', {
+                method: 'POST',
+            })
+        );
+    }
   },
 };

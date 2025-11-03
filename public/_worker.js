@@ -69,6 +69,26 @@ async function getYahooAuth() {
     authRefreshPromise = null;
   }
 }
+function getStorageKey(timeZone) {
+  const now = new Date((/* @__PURE__ */ new Date()).toLocaleString("en-US", { timeZone }));
+  const year = now.getFullYear();
+  const month = (now.getMonth() + 1).toString().padStart(2, "0");
+  const day = now.getDate().toString().padStart(2, "0");
+  const dateStr = `${year}-${month}-${day}`;
+  const { mkt_hours } = getMarketStatus(timeZone);
+  return {
+    key: `data_SPY_${dateStr}_${mkt_hours}`,
+    session: mkt_hours
+  };
+}
+function getDateStr(daysAgo, timeZone) {
+  const now = new Date((/* @__PURE__ */ new Date()).toLocaleString("en-US", { timeZone }));
+  now.setDate(now.getDate() - daysAgo);
+  const year = now.getFullYear();
+  const month = (now.getMonth() + 1).toString().padStart(2, "0");
+  const day = now.getDate().toString().padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
 function getMarketStatus(timeZone) {
   const now = new Date((/* @__PURE__ */ new Date()).toLocaleString("en-US", { timeZone }));
   const mkt_open = new Date(
@@ -322,7 +342,7 @@ function getChartLimits(df, mte_len) {
 }
 async function makeCS(ticker, interval, mkt_hours) {
   const { cookie, crumb } = await getYahooAuth();
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=${interval}&includePrePost=true&crumb=${crumb}`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=2d&interval=${interval}&includePrePost=true&crumb=${crumb}`;
   const res = await fetch(url, {
     headers: {
       ...YF_HEADERS,
@@ -364,18 +384,29 @@ async function makeCS(ticker, interval, mkt_hours) {
   } else if (mkt_hours === "mkt_open") {
     range_start = 390;
     max_cs = open_max_cs[interval];
-    sliced_quotes = valid_quotes.slice(open_slicer[interval]);
+    let slice_start = open_slicer[interval];
+    if (slice_start >= valid_quotes.length) {
+      console.warn(`OHLC 'mkt_open' slicer index ${slice_start} out of bounds. Using all ${valid_quotes.length} quotes.`);
+      slice_start = 0;
+    }
+    sliced_quotes = valid_quotes.slice(slice_start);
   } else if (mkt_hours === "post_mkt") {
     range_start = 240;
     max_cs = post_max_cs[interval];
-    sliced_quotes = valid_quotes.slice(post_slicer[interval]);
+    let slice_start = post_slicer[interval];
+    if (slice_start >= valid_quotes.length) {
+      console.warn(`OHLC 'post_mkt' slicer index ${slice_start} out of bounds. Using all ${valid_quotes.length} quotes.`);
+      slice_start = 0;
+    }
+    sliced_quotes = valid_quotes.slice(slice_start);
   } else if (mkt_hours === "mkt_closed") {
     range_start = 960;
     max_cs = closed_max_cs[interval];
     sliced_quotes = valid_quotes;
   }
   const x_axis_mte = Array.from(
-    { length: sliced_quotes.length },
+    { length: sliced_quotes.length > 0 ? sliced_quotes.length : 1 },
+    // Prevent length 0
     (_, i) => range_start - i * (range_start / (sliced_quotes.length - 1 || 1))
   );
   const ohlc = {
@@ -385,10 +416,17 @@ async function makeCS(ticker, interval, mkt_hours) {
     low: sliced_quotes.map((q) => q.low),
     close: sliced_quotes.map((q) => q.close)
   };
+  if (sliced_quotes.length === 0) {
+    console.error("OHLC slicing resulted in 0 quotes. Returning empty chart.");
+    return { ohlc: { x: [], open: [], high: [], low: [], close: [] }, mktHoursRange: [range_start, 0] };
+  }
   return { ohlc, mktHoursRange: [range_start, 0] };
 }
 
 // src/index.ts
+var APP_TIMEZONE = "Asia/Istanbul";
+var DAYS_OF_DATA_TO_KEEP = 3;
+var TICKER = "SPY";
 var HeatmapBuilderDO = class {
   state;
   constructor(state) {
@@ -396,119 +434,140 @@ var HeatmapBuilderDO = class {
   }
   async fetch(request) {
     const url = new URL(request.url);
-    if (request.method === "POST" && url.pathname === "/updateMap") {
-      const data = await request.json();
-      await this.updateMap(data);
+    if (request.method === "POST" && url.pathname === "/api/v1/addStrip") {
+      const { key } = getStorageKey(APP_TIMEZONE);
+      const newData = await request.json();
+      let sessionData = await this.state.storage.get(key) || {
+        y_strikes: newData.futureMap.y_strikes,
+        strips: [],
+        mtes: [],
+        limits: newData.limits,
+        spot: newData.spot,
+        future_x_mte: [],
+        // <-- Initialize new field
+        future_z_values: []
+        // <-- Initialize new field
+      };
+      sessionData.strips.push(newData.historicalStrip.z_strip);
+      sessionData.mtes.push(newData.historicalStrip.x_mte);
+      sessionData.limits = newData.limits;
+      sessionData.spot = newData.spot;
+      sessionData.future_x_mte = newData.futureMap.x_mte;
+      sessionData.future_z_values = newData.futureMap.z_values;
+      await this.state.storage.put(key, sessionData);
       return new Response("OK");
     }
-    if (request.method === "GET" && url.pathname === "/getCombinedPayload") {
-      const payload = await this.getCombinedPayload();
-      if (payload) {
-        return new Response(JSON.stringify(payload), {
-          headers: { "Content-Type": "application/json" }
-        });
-      } else {
+    if (request.method === "GET" && url.pathname === "/api/v1/getChartData") {
+      const startDate = getDateStr(DAYS_OF_DATA_TO_KEEP, APP_TIMEZONE);
+      const keys = await this.state.storage.list({
+        prefix: `data_${TICKER}_`,
+        start: `data_${TICKER}_${startDate}`
+      });
+      if (keys.size === 0) {
         return new Response(JSON.stringify({ error: "No data available" }), {
           status: 404,
           headers: { "Content-Type": "application/json" }
         });
       }
+      const combined_x_mte = [];
+      const combined_z_values = [];
+      const sessionMarkers = [];
+      let lastKnownSpot = 0;
+      let lastKnownLimits = { up: 0, down: 0 };
+      let y_strikes = [];
+      let latestSession = null;
+      let lastKey = "";
+      for (const [key, sessionData] of keys) {
+        if (!sessionData || !sessionData.mtes || !sessionData.strips) continue;
+        const sessionName = key.split("_").pop() || "session";
+        if (combined_x_mte.length > 0 && !key.endsWith(lastKey.split("_").pop())) {
+          sessionMarkers.push({
+            x: combined_x_mte[combined_x_mte.length - 1],
+            label: sessionName
+          });
+        }
+        lastKey = key;
+        combined_x_mte.push(...[...sessionData.mtes].reverse());
+        if (combined_z_values.length === 0) {
+          y_strikes = sessionData.y_strikes;
+          for (let i = 0; i < y_strikes.length; i++) {
+            combined_z_values.push([]);
+          }
+        }
+        const reversedStrips = [...sessionData.strips].reverse();
+        for (let i = 0; i < y_strikes.length; i++) {
+          for (const strip of reversedStrips) {
+            combined_z_values[i].push(strip[i] || 0);
+          }
+        }
+        latestSession = sessionData;
+      }
+      if (latestSession && latestSession.future_x_mte) {
+        combined_x_mte.push(...latestSession.future_x_mte);
+        for (let i = 0; i < y_strikes.length; i++) {
+          combined_z_values[i].push(...latestSession.future_z_values[i] || []);
+        }
+        lastKnownSpot = latestSession.spot;
+        lastKnownLimits = latestSession.limits;
+      }
+      const payload = {
+        heatmapTrace: {
+          type: "heatmap",
+          x: combined_x_mte,
+          y: y_strikes,
+          z: combined_z_values,
+          colorscale: "Edge",
+          zmid: 0,
+          zsmooth: "best"
+        },
+        limits: lastKnownLimits,
+        spot: lastKnownSpot,
+        sessionMarkers
+      };
+      return new Response(JSON.stringify(payload), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/api/v1/incrementDevTime") {
+      let lastMins = await this.state.storage.get("dev_mins_passed") || 10;
+      lastMins += 1;
+      await this.state.storage.put("dev_mins_passed", lastMins);
+      return new Response(JSON.stringify(lastMins), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/api/v1/deleteOldData") {
+      const endDate = getDateStr(DAYS_OF_DATA_TO_KEEP + 1, APP_TIMEZONE);
+      const oldKeys = await this.state.storage.list({
+        prefix: `data_${TICKER}_`,
+        end: `data_${TICKER}_${endDate}T23:59:59Z`
+        // T23:59:59Z ensures we get the whole day
+      });
+      if (oldKeys.size > 0) {
+        await this.state.storage.delete(Array.from(oldKeys.keys()));
+        return new Response(`Deleted ${oldKeys.size} old keys.`);
+      }
+      return new Response("No old keys to delete.");
     }
     return new Response("Not found", { status: 404 });
-  }
-  async updateMap(data) {
-    let currentState = await this.state.storage.get(
-      "heatmapState"
-    ) || {
-      y_strikes: data.futureMap.y_strikes,
-      locked_x_mte: [],
-      locked_z_strips: [],
-      future_x_mte: [],
-      future_z_values: [],
-      limits: data.limits,
-      spot: data.spot,
-      marketStatus: data.marketStatus
-    };
-    currentState.future_x_mte = data.futureMap.x_mte;
-    currentState.future_z_values = data.futureMap.z_values;
-    currentState.locked_x_mte.push(data.historicalStrip.x_mte);
-    currentState.locked_z_strips.push(data.historicalStrip.z_strip);
-    currentState.limits = data.limits;
-    currentState.spot = data.spot;
-    currentState.marketStatus = data.marketStatus;
-    await this.state.storage.put("heatmapState", currentState);
-  }
-  async getCombinedPayload() {
-    const currentState = await this.state.storage.get("heatmapState");
-    if (!currentState) return null;
-    const combined_x_mte = [
-      ...[...currentState.locked_x_mte].reverse(),
-      ...currentState.future_x_mte
-    ];
-    const numStrikes = currentState.y_strikes.length;
-    const numLockedStrips = currentState.locked_x_mte.length;
-    const combined_z_values = [];
-    const reversedLockedStrips = [...currentState.locked_z_strips].reverse();
-    for (let i = 0; i < numStrikes; i++) {
-      const row = [];
-      for (let j = 0; j < numLockedStrips; j++) {
-        row.push(reversedLockedStrips[j][i] || 0);
-      }
-      row.push(...currentState.future_z_values[i] || []);
-      combined_z_values.push(row);
-    }
-    return {
-      heatmapTrace: {
-        type: "heatmap",
-        x: combined_x_mte,
-        y: currentState.y_strikes,
-        z: combined_z_values,
-        colorscale: "Edge",
-        zmid: 0,
-        zsmooth: "best"
-      },
-      limits: currentState.limits,
-      mteList: combined_x_mte,
-      spot: currentState.spot,
-      marketTime: (/* @__PURE__ */ new Date()).toLocaleString("en-US", {
-        timeZone: "Asia/Istanbul"
-      }),
-      marketStatus: currentState.marketStatus
-    };
   }
 };
 var index_default = {
   /**
-   * This is the main router for ALL requests.
+   * Main router for all requests.
    */
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     try {
       if (url.pathname === "/api/get-gamma-api") {
-        const ticker = url.searchParams.get("ticker")?.toUpperCase() || "SPY";
-        const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+        const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
         const stub = env.GEX_HISTORY_DO.get(doId);
-        const resp = await stub.fetch("https://dummy/getCombinedPayload");
-        if (!resp.ok) {
-          return new Response(
-            JSON.stringify({
-              error: "No heatmap data available yet. Please wait for the next cron run."
-            }),
-            { status: 404, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        const payload = await resp.json();
-        return new Response(JSON.stringify(payload), {
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": "s-maxage=10"
-          }
-        });
+        return await stub.fetch("https://dummy/api/v1/getChartData");
       }
       if (url.pathname === "/api/get-ohlc") {
-        const ticker = url.searchParams.get("ticker")?.toUpperCase() || "SPY";
+        const ticker = url.searchParams.get("ticker")?.toUpperCase() || TICKER;
         const interval = url.searchParams.get("interval") || "5m";
-        const { mkt_hours } = getMarketStatus("Asia/Istanbul");
+        const { mkt_hours } = getMarketStatus(APP_TIMEZONE);
         const { ohlc, mktHoursRange } = await makeCS(
           ticker,
           interval,
@@ -545,43 +604,55 @@ var index_default = {
     }
   },
   /**
-   * This is the cron job handler.
-   * (No changes needed, this is correct)
+   * Cron job handler.
    */
   async scheduled(controller, env, ctx) {
-    const ticker = "SPY";
-    const { mkt_hours, mins_passed } = getMarketStatus("Asia/Istanbul");
+    const doId_dev = env.GEX_HISTORY_DO.idFromName(TICKER);
+    const stub_dev = env.GEX_HISTORY_DO.get(doId_dev);
+    const devTimeRes = await stub_dev.fetch("https://dummy/api/v1/incrementDevTime", {
+      method: "POST"
+    });
+    const new_mins_passed = await devTimeRes.json();
+    console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${new_mins_passed}) ---`);
+    const { mkt_hours, mins_passed } = { mkt_hours: "mkt_open", mins_passed: new_mins_passed };
     if (mkt_hours === "mkt_closed") {
       console.log("Market closed, cron skipping.");
       return;
     }
     const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
-    const { df, spot } = await calc_gamma(ticker, mte_list);
+    const { df, spot } = await calc_gamma(TICKER, mte_list);
     const { limit_up, limit_down } = getChartLimits(df, mte_len);
-    const historicalStrip = {
-      x_mte: df.columns[0],
-      z_strip: df.values.map((row) => row[0])
+    const stripData = {
+      historicalStrip: {
+        x_mte: df.columns[0],
+        z_strip: df.values.map((row) => row[0])
+      },
+      futureMap: {
+        x_mte: df.columns.slice(1),
+        y_strikes: df.index,
+        z_values: df.values.map((row) => row.slice(1))
+      },
+      limits: { up: limit_up, down: limit_down },
+      spot
     };
-    const futureMap = {
-      x_mte: df.columns.slice(1),
-      y_strikes: df.index,
-      z_values: df.values.map((row) => row.slice(1))
-    };
-    const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+    const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
     const stub = env.GEX_HISTORY_DO.get(doId);
     ctx.waitUntil(
-      stub.fetch("https://dummy/updateMap", {
+      stub.fetch("https://dummy/api/v1/addStrip", {
         method: "POST",
-        body: JSON.stringify({
-          futureMap,
-          historicalStrip,
-          limits: { up: limit_up, down: limit_down },
-          spot,
-          marketStatus: mkt_hours
-        }),
+        body: JSON.stringify(stripData),
         headers: { "Content-Type": "application/json" }
       })
     );
+    const now = new Date((/* @__PURE__ */ new Date()).toLocaleString("en-US", { timeZone: APP_TIMEZONE }));
+    if (now.getHours() === 0 && now.getMinutes() < 5) {
+      console.log("Running daily cleanup of old DO keys...");
+      ctx.waitUntil(
+        stub.fetch("https://dummy/api/v1/deleteOldData", {
+          method: "POST"
+        })
+      );
+    }
   }
 };
 export {

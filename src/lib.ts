@@ -89,6 +89,46 @@ export async function getYahooAuth(): Promise<{ cookie: string; crumb: string }>
   }
 }
 
+// --- NEW HELPER FUNCTION ---
+/**
+ * Generates the standardized storage key for the DO.
+ * @param timeZone The app's timeZone (e.g., 'Asia/Istanbul')
+ * @returns { key: string, session: string }
+ */
+export function getStorageKey(timeZone: string): { key: string, session: string } {
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
+  
+  // Get YYYY-MM-DD
+  const year = now.getFullYear();
+  const month = (now.getMonth() + 1).toString().padStart(2, '0');
+  const day = now.getDate().toString().padStart(2, '0');
+  const dateStr = `${year}-${month}-${day}`;
+
+  const { mkt_hours } = getMarketStatus(timeZone);
+
+  // Key format: data_TICKER_YYYY-MM-DD_SESSION
+  return {
+    key: `data_SPY_${dateStr}_${mkt_hours}`,
+    session: mkt_hours
+  };
+}
+
+/**
+ * Gets a date string for X days ago.
+ * @param daysAgo How many days ago
+ * @param timeZone The app's timeZone
+ * @returns YYYY-MM-DD string
+ */
+export function getDateStr(daysAgo: number, timeZone: string): string {
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
+    now.setDate(now.getDate() - daysAgo);
+    
+    const year = now.getFullYear();
+    const month = (now.getMonth() + 1).toString().padStart(2, '0');
+    const day = now.getDate().toString().padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
 export function getMarketStatus(timeZone: string): {
   mkt_hours: string;
   mins_passed: number;
@@ -377,7 +417,8 @@ export type ValidInterval = "1m" | "2m" | "5m" | "15m" | "30m";
 
 export async function makeCS(ticker: string, interval: string, mkt_hours: string) {
   const { cookie, crumb } = await getYahooAuth();
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=${interval}&includePrePost=true&crumb=${crumb}`;
+  // Keep range=2d, it helps provide enough data
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=2d&interval=${interval}&includePrePost=true&crumb=${crumb}`;
   
   const res = await fetch(url, {
     headers: {
@@ -418,6 +459,7 @@ export async function makeCS(ticker: string, interval: string, mkt_hours: string
   let max_cs = 0;
   let sliced_quotes = valid_quotes;
 
+// --- ADD SAFETY CHECKS TO SLICING LOGIC ---
   if (mkt_hours === 'pre_mkt') {
     range_start = 330;
     max_cs = pre_max_cs[interval];
@@ -425,19 +467,35 @@ export async function makeCS(ticker: string, interval: string, mkt_hours: string
   } else if (mkt_hours === 'mkt_open') {
     range_start = 390;
     max_cs = open_max_cs[interval];
-    sliced_quotes = valid_quotes.slice(open_slicer[interval]);
+    
+    let slice_start = open_slicer[interval];
+    if (slice_start >= valid_quotes.length) {
+        console.warn(`OHLC 'mkt_open' slicer index ${slice_start} out of bounds. Using all ${valid_quotes.length} quotes.`);
+        slice_start = 0; // Use all data
+    }
+    sliced_quotes = valid_quotes.slice(slice_start);
+
   } else if (mkt_hours === 'post_mkt') {
     range_start = 240;
     max_cs = post_max_cs[interval];
-    sliced_quotes = valid_quotes.slice(post_slicer[interval]);
+    
+    let slice_start = post_slicer[interval];
+    if (slice_start >= valid_quotes.length) {
+        console.warn(`OHLC 'post_mkt' slicer index ${slice_start} out of bounds. Using all ${valid_quotes.length} quotes.`);
+        slice_start = 0; // Use all data
+    }
+    sliced_quotes = valid_quotes.slice(slice_start);
+
   } else if (mkt_hours === 'mkt_closed') {
     range_start = 960;
     max_cs = closed_max_cs[interval];
     sliced_quotes = valid_quotes;
   }
+  // --- END OF SAFETY CHECKS ---
 
+  // Safety for the x-axis calculation
   const x_axis_mte = Array.from(
-    { length: sliced_quotes.length },
+    { length: sliced_quotes.length > 0 ? sliced_quotes.length : 1 }, // Prevent length 0
     (_, i) => range_start - i * (range_start / (sliced_quotes.length - 1 || 1))
   );
 
@@ -448,5 +506,12 @@ export async function makeCS(ticker: string, interval: string, mkt_hours: string
     low: sliced_quotes.map(q => q.low),
     close: sliced_quotes.map(q => q.close),
   };
+  
+  // If we ended up with no data, return empty arrays but don't crash
+  if (sliced_quotes.length === 0) {
+      console.error("OHLC slicing resulted in 0 quotes. Returning empty chart.");
+      return { ohlc: { x: [], open: [], high: [], low: [], close: [] }, mktHoursRange: [range_start, 0] };
+  }
+  
   return { ohlc, mktHoursRange: [range_start, 0] };
 }
