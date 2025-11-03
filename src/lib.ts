@@ -168,27 +168,37 @@ export function getMteList(mkt_hours: string, mins_passed: number, interval = 10
     post_mkt: 240,
     mkt_closed: 960,
   };
-  let current_interval = Math.floor(mins_passed / 10) * 10;
-  let parts = Math.floor((max_mkt_mins[mkt_hours] - current_interval) / 10);
-  if (mkt_hours === 'pre_mkt') current_interval -= 1110;
-  else if (mkt_hours === 'mkt_open') current_interval -= 0;
-  else if (mkt_hours === 'post_mkt') current_interval -= 390;
-  else if (mkt_hours === 'mkt_closed') {
-    current_interval = 480;
-    parts = 48;
+
+  const max_time = max_mkt_mins[mkt_hours];
+  
+  if (mkt_hours === 'mkt_closed') {
+      // This case isn't used by the cron but good to have
+      const parts = Math.floor(max_time / interval) + 1;
+      const mte_list = Array.from({ length: parts }, (_, i) => max_time - (i * interval)).filter(t => t >= 0);
+      if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) mte_list.push(0);
+      return { mte_list, mte_len: mte_list.length };
   }
-  if (parts < 5) {
-    current_interval =
-      (Math.floor(max_mkt_mins[mkt_hours] / interval) - 5) * interval;
-    parts = 5;
-  }
+
+  // --- THIS IS THE FIX ---
+  // The `mins_passed` argument is now ignored for the calculation,
+  // so the mte_list is always the full list.
+  // -----------------------
+  const parts = Math.floor(max_time / interval) + 1; // +1 to include 0
   const mte_list = Array.from(
-    { length: parts },
-    (_, i) =>
-      max_mkt_mins[mkt_hours] -
-      (i * (max_mkt_mins[mkt_hours] - current_interval)) / (parts - 1 || 1)
-  ).map(Math.floor);
+      { length: parts },
+      (_, i) => max_time - (i * interval)
+  );
+  
+  // Ensure list doesn't go negative and ends at 0
+  while (mte_list.length > 0 && mte_list[mte_list.length - 1] < 0) {
+      mte_list.pop();
+  }
+  if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) {
+      mte_list.push(0);
+  }
+  
   const mte_len = mte_list.length;
+  // mte_list will be [390, 380, 370, ..., 10, 0]
   return { mte_list, mte_len };
 }
 

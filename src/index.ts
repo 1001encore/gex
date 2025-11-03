@@ -331,64 +331,79 @@ export default {
    * Cron job handler.
    */
   async scheduled(
-    controller: ScheduledController,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<void> {
-    // --- 1. Perform Computation ---
-    // const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
-    //const { mkt_hours, mins_passed } = { mkt_hours: 'mkt_open', mins_passed: 30 };
+      controller: ScheduledController,
+      env: Env,
+      ctx: ExecutionContext
+    ): Promise<void> {
+      // --- 1. Perform Computation ---
+      
+      // --- STATEFUL DEV-MODE HACK ---
+      // (This logic is still correct and necessary for testing)
+      const doId_dev = env.GEX_HISTORY_DO.idFromName(TICKER);
+      const stub_dev = env.GEX_HISTORY_DO.get(doId_dev);
+      const devTimeRes = await stub_dev.fetch('https://dummy/api/v1/incrementDevTime', {
+          method: 'POST',
+      });
+      const mins_passed_raw = await devTimeRes.json() as number;
+      console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${mins_passed_raw}) ---`);
+      const { mkt_hours } = { mkt_hours: 'mkt_open' };
+      // -----------------------------
+      
+      // const { mkt_hours, mins_passed_raw } = getMarketStatus(APP_TIMEZONE); // Real code
+      if (mkt_hours === 'mkt_closed') {
+        console.log('Market closed, cron skipping.');
+        return;
+      }
+      
+      // getMteList now ignores mins_passed_raw, which is correct
+      const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed_raw);
+      // df.columns will now always be [390, 380, ..., 0]
+      const { df, spot } = await calc_gamma(TICKER, mte_list);
+      const { limit_up, limit_down } = getChartLimits(df, mte_len);
+      
+      // --- THIS IS THE NEW LOGIC ---
+      // Find the MTE for the *historical* strip
+      // We round mins_passed_raw to the nearest 10-minute interval, just like the columns.
+      const historical_mte = Math.round(mins_passed_raw / 10) * 10;
+      
+      // Find the *index* of this MTE in our df.columns
+      const historical_mte_index = df.columns.indexOf(historical_mte);
+      
+      if (historical_mte_index === -1) {
+          console.error(`Could not find historical MTE ${historical_mte} in df.columns. Skipping run.`);
+          return; // Skip this run
+      }
+      
+      // The historical strip is the data at that *index*
+      const historical_z_strip = df.values.map((row) => row[historical_mte_index]);
+      // -----------------------------
 
-    // --- STATEFUL DEV-MODE HACK ---
-    // Get the DO stub
-    const doId_dev = env.GEX_HISTORY_DO.idFromName(TICKER);
-    const stub_dev = env.GEX_HISTORY_DO.get(doId_dev);
-    
-    // Call our new endpoint to get the *next* minute
-    const devTimeRes = await stub_dev.fetch('https://dummy/api/v1/incrementDevTime', {
-        method: 'POST',
-    });
-    const new_mins_passed = await devTimeRes.json() as number;
-    
-    console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${new_mins_passed}) ---`);
-    const { mkt_hours, mins_passed } = { mkt_hours: 'mkt_open', mins_passed: new_mins_passed };
-    // ----- DEV-MODE HACK END ------
+      const stripData: NewStripData = {
+        historicalStrip: {
+          x_mte: historical_mte, // e.g., 20 (if mins_passed_raw was 22)
+          z_strip: historical_z_strip, // The z-values for MTE 20
+        },
+        futureMap: {
+          x_mte: df.columns, // The *full* list: [390, 380, ..., 0]
+          y_strikes: df.index,
+          z_values: df.values, // The *full* 2D array
+        },
+        limits: { up: limit_up, down: limit_down },
+        spot: spot,
+      };
 
-    // const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE); // Real code
-    if (mkt_hours === 'mkt_closed') {
-      console.log('Market closed, cron skipping.');
-      return;
-    }
-
-    const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
-    const { df, spot } = await calc_gamma(TICKER, mte_list);
-    const { limit_up, limit_down } = getChartLimits(df, mte_len);
-
-    const stripData: NewStripData = {
-      historicalStrip: {
-        x_mte: df.columns[0],
-        z_strip: df.values.map((row) => row[0]),
-      },
-      futureMap: {
-        x_mte: df.columns.slice(1),
-        y_strikes: df.index,
-        z_values: df.values.map((row) => row.slice(1)),
-      },
-      limits: { up: limit_up, down: limit_down },
-      spot: spot,
-    };
-
-    // --- 2. Call DO to Store Data ---
-    const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
-    const stub = env.GEX_HISTORY_DO.get(doId);
-    
-    ctx.waitUntil(
-      stub.fetch('https://dummy/api/v1/addStrip', {
-        method: 'POST',
-        body: JSON.stringify(stripData),
-        headers: { 'Content-Type': 'application/json' },
-      })
-    );
+      // --- 2. Call DO to Store Data ---
+      // (This is unchanged)
+      const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
+      const stub = env.GEX_HISTORY_DO.get(doId);
+      
+      ctx.waitUntil(
+        stub.fetch('https://dummy/api/v1/addStrip', {
+          method: 'POST',
+          body: JSON.stringify(stripData),
+          headers: { 'Content-Type': 'application/json' },
+        })
+      );
 
     // --- 3. Trigger Old Data Deletion (once per day) ---
     // This runs just after midnight in the app's timezone.

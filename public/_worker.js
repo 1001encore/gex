@@ -124,23 +124,24 @@ function getMteList(mkt_hours, mins_passed, interval = 10) {
     post_mkt: 240,
     mkt_closed: 960
   };
-  let current_interval = Math.floor(mins_passed / 10) * 10;
-  let parts = Math.floor((max_mkt_mins[mkt_hours] - current_interval) / 10);
-  if (mkt_hours === "pre_mkt") current_interval -= 1110;
-  else if (mkt_hours === "mkt_open") current_interval -= 0;
-  else if (mkt_hours === "post_mkt") current_interval -= 390;
-  else if (mkt_hours === "mkt_closed") {
-    current_interval = 480;
-    parts = 48;
+  const max_time = max_mkt_mins[mkt_hours];
+  if (mkt_hours === "mkt_closed") {
+    const parts2 = Math.floor(max_time / interval) + 1;
+    const mte_list2 = Array.from({ length: parts2 }, (_, i) => max_time - i * interval).filter((t) => t >= 0);
+    if (mte_list2.length === 0 || mte_list2[mte_list2.length - 1] !== 0) mte_list2.push(0);
+    return { mte_list: mte_list2, mte_len: mte_list2.length };
   }
-  if (parts < 5) {
-    current_interval = (Math.floor(max_mkt_mins[mkt_hours] / interval) - 5) * interval;
-    parts = 5;
-  }
+  const parts = Math.floor(max_time / interval) + 1;
   const mte_list = Array.from(
     { length: parts },
-    (_, i) => max_mkt_mins[mkt_hours] - i * (max_mkt_mins[mkt_hours] - current_interval) / (parts - 1 || 1)
-  ).map(Math.floor);
+    (_, i) => max_time - i * interval
+  );
+  while (mte_list.length > 0 && mte_list[mte_list.length - 1] < 0) {
+    mte_list.pop();
+  }
+  if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) {
+    mte_list.push(0);
+  }
   const mte_len = mte_list.length;
   return { mte_list, mte_len };
 }
@@ -612,25 +613,36 @@ var index_default = {
     const devTimeRes = await stub_dev.fetch("https://dummy/api/v1/incrementDevTime", {
       method: "POST"
     });
-    const new_mins_passed = await devTimeRes.json();
-    console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${new_mins_passed}) ---`);
-    const { mkt_hours, mins_passed } = { mkt_hours: "mkt_open", mins_passed: new_mins_passed };
+    const mins_passed_raw = await devTimeRes.json();
+    console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${mins_passed_raw}) ---`);
+    const { mkt_hours } = { mkt_hours: "mkt_open" };
     if (mkt_hours === "mkt_closed") {
       console.log("Market closed, cron skipping.");
       return;
     }
-    const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
+    const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed_raw);
     const { df, spot } = await calc_gamma(TICKER, mte_list);
     const { limit_up, limit_down } = getChartLimits(df, mte_len);
+    const historical_mte = Math.round(mins_passed_raw / 10) * 10;
+    const historical_mte_index = df.columns.indexOf(historical_mte);
+    if (historical_mte_index === -1) {
+      console.error(`Could not find historical MTE ${historical_mte} in df.columns. Skipping run.`);
+      return;
+    }
+    const historical_z_strip = df.values.map((row) => row[historical_mte_index]);
     const stripData = {
       historicalStrip: {
-        x_mte: df.columns[0],
-        z_strip: df.values.map((row) => row[0])
+        x_mte: historical_mte,
+        // e.g., 20 (if mins_passed_raw was 22)
+        z_strip: historical_z_strip
+        // The z-values for MTE 20
       },
       futureMap: {
-        x_mte: df.columns.slice(1),
+        x_mte: df.columns,
+        // The *full* list: [390, 380, ..., 0]
         y_strikes: df.index,
-        z_values: df.values.map((row) => row.slice(1))
+        z_values: df.values
+        // The *full* 2D array
       },
       limits: { up: limit_up, down: limit_down },
       spot
