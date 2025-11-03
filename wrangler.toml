@@ -2,10 +2,3 @@ name = "gamma-heatmap-pages"
 compatibility_date = "2024-05-01"
 
 pages_build_output_dir = "public"
-
-[[durable_objects.bindings]]
-name = "GEX_HISTORY_DO"
-class_name = "HeatmapBuilderDO"
-# --- THIS IS THE FIX ---
-# We are telling Pages that the DO class is in this project.
-script_name = "gamma-heatmap-pages"
