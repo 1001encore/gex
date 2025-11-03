@@ -344,12 +344,12 @@ export default {
       const devTimeRes = await stub_dev.fetch('https://dummy/api/v1/incrementDevTime', {
           method: 'POST',
       });
-      const mins_passed_raw = await devTimeRes.json() as number;
-      console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${mins_passed_raw}) ---`);
-      const { mkt_hours } = { mkt_hours: 'mkt_open' };
+      //const mins_passed_raw = await devTimeRes.json() as number; // DEV CODE, COMMENT THIS
+      //console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${mins_passed_raw}) ---`); // DEV CODE, COMMENT THIS
+      //const { mkt_hours } = { mkt_hours: 'mkt_open' }; // DEV CODE, COMMENT THIS
       // -----------------------------
       
-      // const { mkt_hours, mins_passed_raw } = getMarketStatus(APP_TIMEZONE); // Real code
+      const { mkt_hours, mins_passed: mins_passed_raw } = getMarketStatus(APP_TIMEZONE); // Real code
       if (mkt_hours === 'mkt_closed') {
         console.log('Market closed, cron skipping.');
         return;
