@@ -274,6 +274,19 @@ export default {
     const url = new URL(request.url);
 
     try {
+      // --- NEW: CATCH THE CRON TRIGGER ---
+      // This route will be called by our new cron trigger.
+      if (url.pathname === '/__cron') {
+        console.log("Cron trigger (via fetch) received, calling scheduled logic...");
+        
+        // Call the 'scheduled' function's logic MANUALLY,
+        // passing in the 'env' we received.
+        // We pass 'null' for the controller because it's not a real schedule event.
+        await this.scheduled(null, env, ctx); 
+        
+        return new Response('OK - Cron Ran');
+      }
+      // ---------------------------------
       // --- FRONT-END API: Get Chart Data ---
       if (url.pathname === '/api/get-gamma-api') {
         const doId = env.GEX_HISTORY_DO.idFromName(TICKER); // One DO per ticker
@@ -331,7 +344,7 @@ export default {
    * Cron job handler.
    */
   async scheduled(
-      controller: ScheduledController,
+      controller: ScheduledController | null,
       env: Env,
       ctx: ExecutionContext
     ): Promise<void> {

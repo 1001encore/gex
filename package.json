@@ -9,6 +9,6 @@
   
   "scripts": {
     "build": "esbuild src/index.ts --bundle --outfile=public/_worker.js --format=esm --sourcemap",
-    "dev": "npm run build && wrangler pages dev public"
+    "dev": "npm run build && wrangler pages dev public --do GEX_HISTORY_DO=HeatmapBuilderDO"
   }
 }

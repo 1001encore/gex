@@ -560,6 +560,11 @@ var index_default = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     try {
+      if (url.pathname === "/__cron") {
+        console.log("Cron trigger (via fetch) received, calling scheduled logic...");
+        await this.scheduled(null, env, ctx);
+        return new Response("OK - Cron Ran");
+      }
       if (url.pathname === "/api/get-gamma-api") {
         const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
         const stub = env.GEX_HISTORY_DO.get(doId);
@@ -613,9 +618,7 @@ var index_default = {
     const devTimeRes = await stub_dev.fetch("https://dummy/api/v1/incrementDevTime", {
       method: "POST"
     });
-    const mins_passed_raw = await devTimeRes.json();
-    console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${mins_passed_raw}) ---`);
-    const { mkt_hours } = { mkt_hours: "mkt_open" };
+    const { mkt_hours, mins_passed: mins_passed_raw } = getMarketStatus(APP_TIMEZONE);
     if (mkt_hours === "mkt_closed") {
       console.log("Market closed, cron skipping.");
       return;
