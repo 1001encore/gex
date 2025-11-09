@@ -13,3 +13,9 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = [ "HeatmapBuilderDO" ]
+
+# --- ADD THIS BLOCK ---
+# This tells Cloudflare to run the 'scheduled'
+# function every 5 minutes.
+[triggers]
+crons = ["*/5 * * * *"]
