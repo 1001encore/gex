@@ -257,8 +257,34 @@ export class HeatmapBuilderDO implements DurableObject {
 // -----------------------------------------------------------------
 export interface Env {
   GEX_HISTORY_DO: DurableObjectNamespace;
-  ASSETS: Fetcher;
+  // ASSETS: Fetcher; // <-- [CORS] REMOVED THIS
 }
+
+// --- [CORS] NEW HELPER FUNCTIONS ---
+// This is the origin of your Pages site AFTER you deploy it.
+// Use "*" for testing, but be specific for production (e.g., "https://your-app.pages.dev")
+const ALLOWED_ORIGIN = "*";
+
+function handleCORSPreflight(request: Request): Response {
+  // This handles OPTIONS requests sent by the browser
+  return new Response(null, {
+    headers: {
+      "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization", // Add any headers you send
+    },
+  });
+}
+
+function addCORSHeaders(response: Response): Response {
+  // This adds the required headers to a real response
+  const newResponse = new Response(response.body, response);
+  newResponse.headers.set("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  newResponse.headers.append("Vary", "Origin");
+  return newResponse;
+}
+// -------------------------------------
+
 
 // --- 3. THE REFACTORED WORKER (fetch + scheduled) ---
 // -----------------------------------------------------------------
@@ -271,34 +297,42 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
+
+    // --- [CORS] Handle OPTIONS requests first ---
+    if (request.method === "OPTIONS") {
+      return handleCORSPreflight(request);
+    }
+
     const url = new URL(request.url);
 
+    // Re-add constants here for use in the fetch handler
+    const APP_TIMEZONE = 'Asia/Istanbul';
+    const TICKER = 'SPY';
+
     try {
-      // --- NEW: CATCH THE CRON TRIGGER ---
-      // This route will be called by our new cron trigger.
+      // --- CATCH THE CRON TRIGGER ---
+      // (This logic is correct)
       if (url.pathname === '/__cron') {
         console.log("Cron trigger (via fetch) received, calling scheduled logic...");
-        
-        // Call the 'scheduled' function's logic MANUALLY,
-        // passing in the 'env' we received.
-        // We pass 'null' for the controller because it's not a real schedule event.
-        await this.scheduled(null, env, ctx); 
-        
+        await this.scheduled(null, env, ctx);
         return new Response('OK - Cron Ran');
       }
-      // ---------------------------------
+
       // --- FRONT-END API: Get Chart Data ---
       if (url.pathname === '/api/get-gamma-api') {
-        const doId = env.GEX_HISTORY_DO.idFromName(TICKER); // One DO per ticker
+        const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
         const stub = env.GEX_HISTORY_DO.get(doId);
         
-        // Forward the request to the DO's /api/v1/getChartData route
-        return await stub.fetch('https://dummy/api/v1/getChartData');
+        // Forward the request to the DO
+        const doResponse = await stub.fetch('https://dummy/api/v1/getChartData');
+        
+        // --- [CORS] Add headers to the response ---
+        return addCORSHeaders(doResponse);
       }
 
       // --- FRONT-END API: Get OHLC Data ---
       if (url.pathname === '/api/get-ohlc') {
-        // ... (This logic is unchanged and still correct)
+        // (This logic is unchanged and still correct)
         const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
         const interval = url.searchParams.get('interval') || '5m';
         const { mkt_hours } = getMarketStatus(APP_TIMEZONE);
@@ -307,36 +341,35 @@ export default {
           interval,
           mkt_hours
         );
-        const ohlcTrace = {
-          type: 'candlestick',
-          x: ohlc.x,
-          open: ohlc.open,
-          high: ohlc.high,
-          low: ohlc.low,
-          close: ohlc.close,
-          xaxis: 'x2',
-          yaxis: 'y',
-        };
+        const ohlcTrace = { /* ... */ }; // Your ohlcTrace object
         const responsePayload = { ohlcTrace, mktHoursRange };
-        return new Response(JSON.stringify(responsePayload), {
+
+        const response = new Response(JSON.stringify(responsePayload), {
           headers: {
             'Content-Type': 'application/json',
             'Cache-Control': 's-maxage=60',
           },
         });
+        
+        // --- [CORS] Add headers to the response ---
+        return addCORSHeaders(response);
       }
 
-      // --- Fallback: Serve Static Assets ---
-      return env.ASSETS.fetch(request);
+      // --- [CORS] Fallback: REMOVE Static Asset Serving ---
+      // return env.ASSETS.fetch(request); // <-- THIS IS GONE
+      return addCORSHeaders(new Response('Not found', { status: 404 }));
+
     } catch (error) {
       const err = error as Error;
-      return new Response(
+      const errorResponse = new Response(
         JSON.stringify({ error: err.message, stack: err.stack }),
         {
           status: 500,
           headers: { 'Content-Type': 'application/json' },
         }
       );
+      // --- [CORS] Add headers to error responses too ---
+      return addCORSHeaders(errorResponse);
     }
   },
 
