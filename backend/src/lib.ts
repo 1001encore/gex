@@ -24,46 +24,39 @@ export async function refreshYahooAuth(): Promise<{
   cookie: string;
   crumb: string;
 }> {
-  console.log('--- Starting new Yahoo auth refresh... ---');
-  const consentCookie =
-    'A3=d=AQAB&S=AQABCAFFp2QAAAAifp2Q-Z3-l1kBEiL2S-sYBwEBAgABBwE-mAAAAg&Y=YAIA';
-  const headersWithConsent = { ...YF_HEADERS, Cookie: consentCookie };
-  const cookieRes = await fetch('https://finance.yahoo.com/quote/SPY', {
-    headers: headersWithConsent,
-    redirect: 'follow',
-  });
+  console.log('--- Starting new Yahoo auth refresh (v3)... ---');
+  
+  // Let's try to get the crumb AND cookies from the crumb endpoint directly
+  const crumbRes = await fetch(
+    'https://query1.finance.yahoo.com/v1/test/getcrumb',
+    {
+      headers: YF_HEADERS, // Send basic user-agent
+      redirect: 'follow',
+    }
+  );
 
-  // Manual, bulletproof way to get cookies
+  if (!crumbRes.ok) {
+    throw new Error(`Failed to get Yahoo crumb: ${crumbRes.statusText}`);
+  }
+
+  // Get the cookies from this response
   const setCookieHeaders: string[] = [];
-  cookieRes.headers.forEach((value, key) => {
+  crumbRes.headers.forEach((value, key) => {
     if (key.toLowerCase() === 'set-cookie') {
-      setCookieHeaders.push(value);
+      setCookieHeaders.push(value.split(';')[0]); 
     }
   });
 
   if (setCookieHeaders.length === 0) {
-    console.error(`Failed to get Yahoo cookie headers. Status: ${cookieRes.status}`);
-    const body = await cookieRes.text();
-    console.error('Response body snippet:', body.substring(0, 500));
-    throw new Error('Failed to get Yahoo cookie. No consent page, but no cookies either.');
+    // This is a different error, so we'll know if this attempt failed
+    throw new Error('Crumb request succeeded but returned no cookies.');
   }
-
-  const receivedCookies = setCookieHeaders.join('; ');
-  const cookie = consentCookie + '; ' + receivedCookies;
-  const headersWithFullCookie = { ...YF_HEADERS, Cookie: cookie };
-
-  const crumbRes = await fetch(
-    'https://query1.finance.yahoo.com/v1/test/getcrumb',
-    {
-      headers: headersWithFullCookie,
-    }
-  );
-  if (!crumbRes.ok) {
-    throw new Error(`Failed to get Yahoo crumb: ${crumbRes.statusText}`);
-  }
+  
+  const cookie = setCookieHeaders.join('; ');
   const crumb = await crumbRes.text();
   if (!crumb) throw new Error('Crumb response was empty.');
 
+  // Save the new auth details
   const newAuth = { cookie, crumb };
   yahooAuth = { ...newAuth, expiry: Date.now() + AUTH_TTL_MS };
   console.log('--- Successfully refreshed Yahoo auth. ---');
@@ -148,16 +141,24 @@ export function getMarketStatus(timeZone: string): {
   const mins_passed = Math.floor(
     (nowInTZ.getTime() - mktOpenInTZ.getTime()) / 60000
   );
+
+  // --- NEW, CORRECTED LOGIC ---
   if (dayOfWeek === 0 || dayOfWeek === 6)
     return { mkt_hours: 'mkt_closed', mins_passed };
-  if (mins_passed > 630 && mins_passed < 1110)
-    return { mkt_hours: 'mkt_closed', mins_passed };
-  if (mins_passed >= 390 && mins_passed <= 630)
-    return { mkt_hours: 'post_mkt', mins_passed };
-  if (mins_passed >= 0 && mins_passed <= 390)
+
+  // 16:30 - 00:00 (7.5 hours = 450 mins)
+  if (mins_passed >= 0 && mins_passed <= 450)
     return { mkt_hours: 'mkt_open', mins_passed };
+
+  // 00:00 - 04:00 (4 hours = 240 mins). We'll keep a 4-hour post-market.
+  if (mins_passed > 450 && mins_passed <= 690) // 450 + 240 = 690
+    return { mkt_hours: 'post_mkt', mins_passed };
+  
+  // 1110 is 16:30 - 5.5h (11:00). We keep the pre-market logic the same.
   if (mins_passed >= 1110 && mins_passed <= 1440)
     return { mkt_hours: 'pre_mkt', mins_passed };
+  
+  // All other times are closed
   return { mkt_hours: 'mkt_closed', mins_passed };
 }
 
@@ -171,35 +172,25 @@ export function getMteList(mkt_hours: string, mins_passed: number, interval = 10
 
   const max_time = max_mkt_mins[mkt_hours];
   
-  if (mkt_hours === 'mkt_closed') {
-      // This case isn't used by the cron but good to have
-      const parts = Math.floor(max_time / interval) + 1;
-      const mte_list = Array.from({ length: parts }, (_, i) => max_time - (i * interval)).filter(t => t >= 0);
-      if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) mte_list.push(0);
-      return { mte_list, mte_len: mte_list.length };
+  // If market is open, we ALWAYS return the full day grid [390, 380... 0]
+  // The worker will decide which column is "now".
+  if (mkt_hours === 'mkt_open') {
+      const parts = Math.floor(390 / interval) + 1; 
+      return { 
+          mte_list: Array.from({ length: parts }, (_, i) => 390 - (i * interval)),
+          mte_len: parts 
+      };
   }
 
-  // --- THIS IS THE FIX ---
-  // The `mins_passed` argument is now ignored for the calculation,
-  // so the mte_list is always the full list.
-  // -----------------------
-  const parts = Math.floor(max_time / interval) + 1; // +1 to include 0
-  const mte_list = Array.from(
-      { length: parts },
-      (_, i) => max_time - (i * interval)
-  );
+  // Fallback for pre/post market logic (existing logic)
+  const parts = Math.floor(max_time / interval) + 1;
+  const mte_list = Array.from({ length: parts }, (_, i) => max_time - (i * interval));
   
-  // Ensure list doesn't go negative and ends at 0
-  while (mte_list.length > 0 && mte_list[mte_list.length - 1] < 0) {
-      mte_list.pop();
-  }
-  if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) {
-      mte_list.push(0);
-  }
+  // Clean up negatives
+  while (mte_list.length > 0 && mte_list[mte_list.length - 1] < 0) mte_list.pop();
+  if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) mte_list.push(0);
   
-  const mte_len = mte_list.length;
-  // mte_list will be [390, 380, 370, ..., 10, 0]
-  return { mte_list, mte_len };
+  return { mte_list, mte_len: mte_list.length };
 }
 
 export interface GammaDf {

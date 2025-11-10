@@ -18,4 +18,4 @@ new_sqlite_classes = [ "HeatmapBuilderDO" ]
 # This tells Cloudflare to run the 'scheduled'
 # function every 5 minutes.
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]

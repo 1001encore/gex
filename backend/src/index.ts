@@ -10,61 +10,41 @@ import {
   DurableObject,
 } from '@cloudflare/workers-types';
 
-// 1. IMPORT PATH FIXED (and new helpers)
 import {
   calc_gamma,
   getMteList,
   getMarketStatus,
   getChartLimits,
   makeCS,
-  getStorageKey, // <-- NEW
-  getDateStr,   // <-- NEW
+  getStorageKey,
+  getDateStr,
 } from './lib';
-import type { GammaDf } from './lib';
 
 // --- CONSTANTS ---
 const APP_TIMEZONE = 'Asia/Istanbul';
 const DAYS_OF_DATA_TO_KEEP = 3;
 const TICKER = 'SPY';
 
-// --- NEW TYPE DEFINITIONS ---
-// This is what we store for *each session*
+// --- INTERFACES ---
 interface SessionData {
   y_strikes: number[];
-  strips: number[][]; // An array of value arrays (z-strips)
-  mtes: number[];     // An array of mte values (x-axis)
+  strips: number[][]; // Historical Z-values
+  mtes: number[];     // Historical MTE values (e.g., [390, 380...])
   limits: { up: number; down: number };
   spot: number;
-
-  // --- ADD THESE TWO LINES ---
+  
+  // The "Future" cache (Overwritten every minute)
   future_x_mte: number[];
   future_z_values: number[][];
 }
 
-// This is what we send to the front-end
-interface FinalPayload {
-  heatmapTrace: {
-    type: 'heatmap';
-    x: number[]; // All mtes combined
-    y: number[]; // All strikes
-    z: number[][]; // All strips combined
-    colorscale: 'Edge';
-    zmid: 0;
-    zsmooth: 'best';
-  };
-  limits: { up: number; down: number };
-  spot: number;
-  sessionMarkers: { x: number, label: string }[]; // <-- NEW: for drawing lines
-}
-
-// This is the data format from the scheduled function
 interface NewStripData {
   historicalStrip: {
-    x_mte: number;
-    z_strip: number[];
+    x_mte: number;       // The MTE value for this minute
+    z_strip: number[];   // The column of values
   };
   futureMap: {
-    x_mte: number[];
+    x_mte: number[];     // MTEs for the rest of the day
     y_strikes: number[];
     z_values: number[][];
   };
@@ -72,10 +52,7 @@ interface NewStripData {
   spot: number;
 }
 
-
-// --- 1. THE REFACTORED DURABLE OBJECT ---
-// The DO is now a pure key-value storage manager.
-// -----------------------------------------------------------------
+// --- 1. THE DURABLE OBJECT ---
 export class HeatmapBuilderDO implements DurableObject {
   state: DurableObjectState;
 
@@ -91,30 +68,37 @@ export class HeatmapBuilderDO implements DurableObject {
       const { key } = getStorageKey(APP_TIMEZONE);
       const newData = (await request.json()) as NewStripData;
 
-      // Get existing data for this session, or create new
+      // Get existing data or init new
       let sessionData: SessionData = (await this.state.storage.get(key)) || {
         y_strikes: newData.futureMap.y_strikes,
         strips: [],
         mtes: [],
         limits: newData.limits,
         spot: newData.spot,
-        future_x_mte: [], // <-- Initialize new field
-        future_z_values: [] // <-- Initialize new field
+        future_x_mte: [],
+        future_z_values: []
       };
 
-      // Append new strip
-      sessionData.strips.push(newData.historicalStrip.z_strip);
-      sessionData.mtes.push(newData.historicalStrip.x_mte);
-      
-      // --- UPDATE THESE LINES ---
-      // Update with latest "future" data, spot, and limits
-      sessionData.limits = newData.limits;
-      sessionData.spot = newData.spot;
+      // 1. Append the new HISTORICAL strip
+      // We check to avoid duplicates if cron misfires
+      if (!sessionData.mtes.includes(newData.historicalStrip.x_mte)) {
+          sessionData.strips.push(newData.historicalStrip.z_strip);
+          sessionData.mtes.push(newData.historicalStrip.x_mte);
+      }
+
+      // 2. Overwrite the FUTURE map
+      // The worker has already sliced this to exclude history, so we just save it.
       sessionData.future_x_mte = newData.futureMap.x_mte;
       sessionData.future_z_values = newData.futureMap.z_values;
-      // --------------------------
+      
+      // 3. Update metadata
+      sessionData.limits = newData.limits;
+      sessionData.spot = newData.spot;
+      // Update strikes if they expanded (rare but possible)
+      if (newData.futureMap.y_strikes.length > sessionData.y_strikes.length) {
+          sessionData.y_strikes = newData.futureMap.y_strikes;
+      }
 
-      // Write back to the unique key
       await this.state.storage.put(key, sessionData);
       return new Response('OK');
     }
@@ -129,76 +113,69 @@ export class HeatmapBuilderDO implements DurableObject {
       });
 
       if (keys.size === 0) {
-        return new Response(JSON.stringify({ error: 'No data available' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        });
+        return new Response(JSON.stringify({ error: 'No data available' }), { status: 404 });
       }
 
-      // Stitch all session data together
+      // Arrays to hold the final stitched chart
       const combined_x_mte: number[] = [];
       const combined_z_values: number[][] = [];
       const sessionMarkers: { x: number; label: string }[] = [];
+      
       let lastKnownSpot = 0;
       let lastKnownLimits = { up: 0, down: 0 };
       let y_strikes: number[] = [];
-      
-      // --- NEW: Need to track the latest session to get its future map ---
       let latestSession: SessionData | null = null;
-      let lastKey = "";
 
+      // 1. Iterate over all saved sessions (Days)
       for (const [key, sessionData] of keys) {
-        if (!sessionData || !sessionData.mtes || !sessionData.strips) continue;
+        if (!sessionData || !sessionData.mtes) continue;
         
+        // Marker for visual separation of days
         const sessionName = key.split('_').pop() || 'session'; 
-
-        if (combined_x_mte.length > 0 && !key.endsWith(lastKey.split('_').pop()!)) {
+        if (combined_x_mte.length > 0) {
             sessionMarkers.push({
                 x: combined_x_mte[combined_x_mte.length - 1], 
                 label: sessionName,
             });
         }
-        lastKey = key;
 
-        // Combine historical mtes (x-axis)
-        combined_x_mte.push(...[...sessionData.mtes].reverse());
-
-        // Combine historical strips (z-axis)
+        // Initialize Z-matrix dimensions if this is the first data found
         if (combined_z_values.length === 0) {
             y_strikes = sessionData.y_strikes;
-            for (let i = 0; i < y_strikes.length; i++) {
-                combined_z_values.push([]);
-            }
+            for (let i = 0; i < y_strikes.length; i++) combined_z_values.push([]);
         }
-        
-        const reversedStrips = [...sessionData.strips].reverse();
+
+        // Append HISTORICAL data
+        // Note: mtes are stored like [390, 380...]. We append them in that order (Time Ascending).
+        combined_x_mte.push(...sessionData.mtes);
+
+        // Append Z-strips
         for (let i = 0; i < y_strikes.length; i++) {
-            for (const strip of reversedStrips) {
+            for (const strip of sessionData.strips) {
                 combined_z_values[i].push(strip[i] || 0);
             }
         }
         
-        // --- Store the *latest* session data ---
         latestSession = sessionData;
       }
       
-      // --- NEW: Append the latest "future" map ---
-      if (latestSession && latestSession.future_x_mte) {
-          // Add future x-axis values
+      // 2. Append the FUTURE projection (Only for the latest session)
+      // Since the Worker sliced this perfectly, we just paste it on the end.
+      if (latestSession && latestSession.future_x_mte && latestSession.future_x_mte.length > 0) {
+          
           combined_x_mte.push(...latestSession.future_x_mte);
           
-          // Add future z-axis values
           for (let i = 0; i < y_strikes.length; i++) {
-              combined_z_values[i].push(...(latestSession.future_z_values[i] || []));
+              // Get the row for this strike from the future map
+              const futureRow = latestSession.future_z_values[i] || [];
+              combined_z_values[i].push(...futureRow);
           }
           
-          // Update spot/limits to the absolute latest
           lastKnownSpot = latestSession.spot;
           lastKnownLimits = latestSession.limits;
       }
-      // ------------------------------------------
 
-      const payload: FinalPayload = {
+      const payload = {
         heatmapTrace: {
           type: 'heatmap',
           x: combined_x_mte,
@@ -217,250 +194,157 @@ export class HeatmapBuilderDO implements DurableObject {
         headers: { 'Content-Type': 'application/json' },
       });
     }
-
-    // --- ROUTE C: Increment Dev Time (FOR LOCAL TESTING) ---
-    if (request.method === 'POST' && url.pathname === '/api/v1/incrementDevTime') {
-        // Get the last time, or default to 10
-        let lastMins = await this.state.storage.get<number>('dev_mins_passed') || 10;
-        
-        // Increment by 1 minute
-        lastMins += 1; 
-
-        await this.state.storage.put('dev_mins_passed', lastMins);
-        return new Response(JSON.stringify(lastMins), {
-            headers: { 'Content-Type': 'application/json' },
-        });
-    }
-
-    // --- ROUTE D: Delete old data (called by cron) ---
+    
+    // --- ROUTE C: Delete Old Data ---
     if (request.method === 'POST' && url.pathname === '/api/v1/deleteOldData') {
         const endDate = getDateStr(DAYS_OF_DATA_TO_KEEP + 1, APP_TIMEZONE);
-
-        // List all keys *up to* 4 days ago
         const oldKeys = await this.state.storage.list({
             prefix: `data_${TICKER}_`,
-            end: `data_${TICKER}_${endDate}T23:59:59Z`, // T23:59:59Z ensures we get the whole day
+            end: `data_${TICKER}_${endDate}T23:59:59Z`,
         });
-
         if (oldKeys.size > 0) {
             await this.state.storage.delete(Array.from(oldKeys.keys()));
-            return new Response(`Deleted ${oldKeys.size} old keys.`);
         }
-        return new Response('No old keys to delete.');
+        return new Response('Cleaned');
     }
 
     return new Response('Not found', { status: 404 });
   }
 }
 
-// --- 2. DEFINE THE WORKER ENVIRONMENT ---
-// -----------------------------------------------------------------
+// --- 2. THE WORKER ---
 export interface Env {
   GEX_HISTORY_DO: DurableObjectNamespace;
-  // ASSETS: Fetcher; // <-- [CORS] REMOVED THIS
 }
 
-// --- [CORS] NEW HELPER FUNCTIONS ---
-// This is the origin of your Pages site AFTER you deploy it.
-// Use "*" for testing, but be specific for production (e.g., "https://your-app.pages.dev")
+// CORS Helpers
 const ALLOWED_ORIGIN = "*";
-
-function handleCORSPreflight(request: Request): Response {
-  // This handles OPTIONS requests sent by the browser
-  return new Response(null, {
-    headers: {
-      "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization", // Add any headers you send
-    },
-  });
-}
-
 function addCORSHeaders(response: Response): Response {
-  // This adds the required headers to a real response
   const newResponse = new Response(response.body, response);
   newResponse.headers.set("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   newResponse.headers.append("Vary", "Origin");
   return newResponse;
 }
-// -------------------------------------
 
-
-// --- 3. THE REFACTORED WORKER (fetch + scheduled) ---
-// -----------------------------------------------------------------
 export default {
-  /**
-   * Main router for all requests.
-   */
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
-
-    // --- [CORS] Handle OPTIONS requests first ---
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
-      return handleCORSPreflight(request);
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
     }
 
     const url = new URL(request.url);
 
-    // Re-add constants here for use in the fetch handler
-    const APP_TIMEZONE = 'Asia/Istanbul';
-    const TICKER = 'SPY';
-
     try {
-      // --- CATCH THE CRON TRIGGER ---
-      // (This logic is correct)
       if (url.pathname === '/__cron') {
-        console.log("Cron trigger (via fetch) received, calling scheduled logic...");
         await this.scheduled(null, env, ctx);
-        return new Response('OK - Cron Ran');
+        return new Response('Cron Ran');
       }
 
-      // --- FRONT-END API: Get Chart Data ---
       if (url.pathname === '/api/get-gamma-api') {
-        const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
+        const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
+        const doId = env.GEX_HISTORY_DO.idFromName(ticker);
         const stub = env.GEX_HISTORY_DO.get(doId);
-        
-        // Forward the request to the DO
-        const doResponse = await stub.fetch('https://dummy/api/v1/getChartData');
-        
-        // --- [CORS] Add headers to the response ---
-        return addCORSHeaders(doResponse);
+        return addCORSHeaders(await stub.fetch('https://dummy/api/v1/getChartData'));
       }
 
-      // --- FRONT-END API: Get OHLC Data ---
       if (url.pathname === '/api/get-ohlc') {
-        // (This logic is unchanged and still correct)
         const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
         const interval = url.searchParams.get('interval') || '5m';
         const { mkt_hours } = getMarketStatus(APP_TIMEZONE);
-        const { ohlc, mktHoursRange } = await makeCS(
-          ticker,
-          interval,
-          mkt_hours
-        );
-        const ohlcTrace = { /* ... */ }; // Your ohlcTrace object
-        const responsePayload = { ohlcTrace, mktHoursRange };
-
-        const response = new Response(JSON.stringify(responsePayload), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Cache-Control': 's-maxage=60',
-          },
-        });
-        
-        // --- [CORS] Add headers to the response ---
-        return addCORSHeaders(response);
+        const { ohlc, mktHoursRange } = await makeCS(ticker, interval, mkt_hours);
+        return addCORSHeaders(new Response(JSON.stringify({ ohlc, mktHoursRange }), {
+             headers: { 'Content-Type': 'application/json' } 
+        }));
       }
 
-      // --- [CORS] Fallback: REMOVE Static Asset Serving ---
-      // return env.ASSETS.fetch(request); // <-- THIS IS GONE
       return addCORSHeaders(new Response('Not found', { status: 404 }));
 
     } catch (error) {
       const err = error as Error;
-      const errorResponse = new Response(
-        JSON.stringify({ error: err.message, stack: err.stack }),
-        {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        }
-      );
-      // --- [CORS] Add headers to error responses too ---
-      return addCORSHeaders(errorResponse);
+      return addCORSHeaders(new Response(JSON.stringify({ error: err.message }), { status: 500 }));
     }
   },
 
-  /**
-   * Cron job handler.
-   */
-  async scheduled(
-      controller: ScheduledController | null,
-      env: Env,
-      ctx: ExecutionContext
-    ): Promise<void> {
-      // --- 1. Perform Computation ---
+  async scheduled(controller: ScheduledController | null, env: Env, ctx: ExecutionContext): Promise<void> {
+      // 1. Check Market Status
+      const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
       
-      // --- STATEFUL DEV-MODE HACK ---
-      // (This logic is still correct and necessary for testing)
-      const doId_dev = env.GEX_HISTORY_DO.idFromName(TICKER);
-      const stub_dev = env.GEX_HISTORY_DO.get(doId_dev);
-      const devTimeRes = await stub_dev.fetch('https://dummy/api/v1/incrementDevTime', {
-          method: 'POST',
-      });
-      //const mins_passed_raw = await devTimeRes.json() as number; // DEV CODE, COMMENT THIS
-      //console.log(`--- RUNNING IN DEV MODE: FORCING MARKET OPEN (Minute: ${mins_passed_raw}) ---`); // DEV CODE, COMMENT THIS
-      //const { mkt_hours } = { mkt_hours: 'mkt_open' }; // DEV CODE, COMMENT THIS
-      // -----------------------------
-      
-      const { mkt_hours, mins_passed: mins_passed_raw } = getMarketStatus(APP_TIMEZONE); // Real code
-      if (mkt_hours === 'mkt_closed') {
-        console.log('Market closed, cron skipping.');
+      if (mkt_hours === 'mkt_closed' || mkt_hours === 'post_mkt') {
+        // Optional: Run cleanup logic here if needed
         return;
       }
       
-      // getMteList now ignores mins_passed_raw, which is correct
-      const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed_raw);
-      // df.columns will now always be [390, 380, ..., 0]
+      // 2. Calculate Full Gamma Chart (History + Future)
+      // mte_list will be [390, 380, ... 0]
+      const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
       const { df, spot } = await calc_gamma(TICKER, mte_list);
       const { limit_up, limit_down } = getChartLimits(df, mte_len);
       
-      // --- THIS IS THE NEW LOGIC ---
-      // Find the MTE for the *historical* strip
-      // We round mins_passed_raw to the nearest 10-minute interval, just like the columns.
-      const historical_mte = Math.round(mins_passed_raw / 10) * 10;
+      // 3. IDENTIFY THE CURRENT STRIPE VS FUTURE
+      // We need to map "mins_passed" (time up) to "MTE" (time down).
+      // Example: mins_passed = 12. Round to 10. MTE = 390 - 10 = 380.
       
-      // Find the *index* of this MTE in our df.columns
-      const historical_mte_index = df.columns.indexOf(historical_mte);
+      // Round down to nearest 10-min bucket
+      const current_bucket_mins = Math.round(mins_passed / 10) * 10;
       
-      if (historical_mte_index === -1) {
-          console.error(`Could not find historical MTE ${historical_mte} in df.columns. Skipping run.`);
-          return; // Skip this run
+      // Convert to MTE (Assuming 390 is start of day, 0 is end)
+      // Note: If you want 390 to be 9:30AM, use: target_mte = 390 - current_bucket_mins
+      const target_mte = 390 - current_bucket_mins;
+      
+      // Find where this MTE lives in the columns [390, 380 ... 0]
+      const splitIndex = df.columns.indexOf(target_mte);
+      
+      if (splitIndex === -1) {
+          console.log(`Current MTE ${target_mte} not found in columns. Likely pre/post market fringe. Skipping.`);
+          return;
       }
+
+      // 4. PREPARE PAYLOAD
       
-      // The historical strip is the data at that *index*
-      const historical_z_strip = df.values.map((row) => row[historical_mte_index]);
-      // -----------------------------
+      // The Stripe: The single column at splitIndex
+      const historical_z_strip = df.values.map(row => row[splitIndex]);
+
+      // The Future: Everything AFTER splitIndex (because columns are descending 390->0)
+      // If splitIndex is 1 (MTE 380), we want indices 2...end (MTE 370...0)
+      const future_columns = df.columns.slice(splitIndex + 1);
+      
+      // We must slice every row in the 2D array
+      const future_z_values = df.values.map(row => row.slice(splitIndex + 1));
 
       const stripData: NewStripData = {
         historicalStrip: {
-          x_mte: historical_mte, // e.g., 20 (if mins_passed_raw was 22)
-          z_strip: historical_z_strip, // The z-values for MTE 20
+          x_mte: target_mte,
+          z_strip: historical_z_strip,
         },
         futureMap: {
-          x_mte: df.columns, // The *full* list: [390, 380, ..., 0]
+          x_mte: future_columns,
           y_strikes: df.index,
-          z_values: df.values, // The *full* 2D array
+          z_values: future_z_values,
         },
         limits: { up: limit_up, down: limit_down },
         spot: spot,
       };
 
-      // --- 2. Call DO to Store Data ---
-      // (This is unchanged)
+      // 5. Send to DO
       const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
       const stub = env.GEX_HISTORY_DO.get(doId);
       
-      ctx.waitUntil(
-        stub.fetch('https://dummy/api/v1/addStrip', {
+      ctx.waitUntil(stub.fetch('https://dummy/api/v1/addStrip', {
           method: 'POST',
           body: JSON.stringify(stripData),
           headers: { 'Content-Type': 'application/json' },
-        })
-      );
+      }));
 
-    // --- 3. Trigger Old Data Deletion (once per day) ---
-    // This runs just after midnight in the app's timezone.
-    const now = new Date(new Date().toLocaleString('en-US', { timeZone: APP_TIMEZONE }));
-    if (now.getHours() === 0 && now.getMinutes() < 5) { // Run between 00:00 and 00:05
-        console.log('Running daily cleanup of old DO keys...');
-        ctx.waitUntil(
-            stub.fetch('https://dummy/api/v1/deleteOldData', {
-                method: 'POST',
-            })
-        );
-    }
+      // Cleanup trigger (Runs once at midnight)
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: APP_TIMEZONE }));
+      if (now.getHours() === 0 && now.getMinutes() < 5) {
+          ctx.waitUntil(stub.fetch('https://dummy/api/v1/deleteOldData', { method: 'POST' }));
+      }
   },
 };
