@@ -1,21 +1,19 @@
-name = "1001terminal-worker" # This will be part of your .workers.dev URL
+name = "1001terminal-worker"
 main = "src/index.ts"
-compatibility_date = "2024-05-01" # Use a recent date
+compatibility_date = "2024-05-01"
 
-# This part is essential for Durable Objects
 [durable_objects]
 bindings = [
   { name = "GEX_HISTORY_DO", class_name = "HeatmapBuilderDO" }
 ]
 
-# --- THIS IS THE FIX ---
-# Change "new_classes" to "new_sqlite_classes" for the free plan
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = [ "HeatmapBuilderDO" ]
 
-# --- ADD THIS BLOCK ---
-# This tells Cloudflare to run the 'scheduled'
-# function every 5 minutes.
+# --- OPTIMIZED CRON ---
+# Run every minute (*),
+# But ONLY during hours 11 through 23 UTC (approx 6am - 6pm EST),
+# And ONLY on Monday through Friday (1-5).
 [triggers]
-crons = ["* * * * *"]
+crons = ["* 11-23 * * 1-5"]

@@ -28,23 +28,21 @@ const TICKER = 'SPY';
 // --- INTERFACES ---
 interface SessionData {
   y_strikes: number[];
-  strips: number[][]; // Historical Z-values
-  mtes: number[];     // Historical MTE values (e.g., [390, 380...])
+  strips: number[][]; 
+  mtes: number[];     
   limits: { up: number; down: number };
   spot: number;
-  
-  // The "Future" cache (Overwritten every minute)
   future_x_mte: number[];
   future_z_values: number[][];
 }
 
 interface NewStripData {
   historicalStrip: {
-    x_mte: number;       // The MTE value for this minute
-    z_strip: number[];   // The column of values
+    x_mte: number;       
+    z_strip: number[];   
   };
   futureMap: {
-    x_mte: number[];     // MTEs for the rest of the day
+    x_mte: number[];     
     y_strikes: number[];
     z_values: number[][];
   };
@@ -68,7 +66,6 @@ export class HeatmapBuilderDO implements DurableObject {
       const { key } = getStorageKey(APP_TIMEZONE);
       const newData = (await request.json()) as NewStripData;
 
-      // Get existing data or init new
       let sessionData: SessionData = (await this.state.storage.get(key)) || {
         y_strikes: newData.futureMap.y_strikes,
         strips: [],
@@ -79,22 +76,17 @@ export class HeatmapBuilderDO implements DurableObject {
         future_z_values: []
       };
 
-      // 1. Append the new HISTORICAL strip
-      // We check to avoid duplicates if cron misfires
+      // Atomic Update: We modify the object in memory and save it once.
       if (!sessionData.mtes.includes(newData.historicalStrip.x_mte)) {
           sessionData.strips.push(newData.historicalStrip.z_strip);
           sessionData.mtes.push(newData.historicalStrip.x_mte);
       }
 
-      // 2. Overwrite the FUTURE map
-      // The worker has already sliced this to exclude history, so we just save it.
       sessionData.future_x_mte = newData.futureMap.x_mte;
       sessionData.future_z_values = newData.futureMap.z_values;
-      
-      // 3. Update metadata
       sessionData.limits = newData.limits;
       sessionData.spot = newData.spot;
-      // Update strikes if they expanded (rare but possible)
+      
       if (newData.futureMap.y_strikes.length > sessionData.y_strikes.length) {
           sessionData.y_strikes = newData.futureMap.y_strikes;
       }
@@ -105,18 +97,19 @@ export class HeatmapBuilderDO implements DurableObject {
 
     // --- ROUTE B: Get combined data (called by front-end) ---
     if (request.method === 'GET' && url.pathname === '/api/v1/getChartData') {
-      const startDate = getDateStr(DAYS_OF_DATA_TO_KEEP, APP_TIMEZONE);
-      
-      const keys = await this.state.storage.list<SessionData>({
+      // List all keys. We will filter them in memory to be safe.
+      const listMap = await this.state.storage.list<SessionData>({
         prefix: `data_${TICKER}_`,
-        start: `data_${TICKER}_${startDate}`,
       });
 
-      if (keys.size === 0) {
+      if (listMap.size === 0) {
         return new Response(JSON.stringify({ error: 'No data available' }), { status: 404 });
       }
 
-      // Arrays to hold the final stitched chart
+      // Sort keys to ensure chronological order (Oldest -> Newest)
+      // Key format: data_SPY_YYYY-MM-DD_session
+      const sortedKeys = Array.from(listMap.keys()).sort();
+
       const combined_x_mte: number[] = [];
       const combined_z_values: number[][] = [];
       const sessionMarkers: { x: number; label: string }[] = [];
@@ -126,11 +119,10 @@ export class HeatmapBuilderDO implements DurableObject {
       let y_strikes: number[] = [];
       let latestSession: SessionData | null = null;
 
-      // 1. Iterate over all saved sessions (Days)
-      for (const [key, sessionData] of keys) {
+      for (const key of sortedKeys) {
+        const sessionData = listMap.get(key);
         if (!sessionData || !sessionData.mtes) continue;
         
-        // Marker for visual separation of days
         const sessionName = key.split('_').pop() || 'session'; 
         if (combined_x_mte.length > 0) {
             sessionMarkers.push({
@@ -139,17 +131,13 @@ export class HeatmapBuilderDO implements DurableObject {
             });
         }
 
-        // Initialize Z-matrix dimensions if this is the first data found
         if (combined_z_values.length === 0) {
             y_strikes = sessionData.y_strikes;
             for (let i = 0; i < y_strikes.length; i++) combined_z_values.push([]);
         }
 
-        // Append HISTORICAL data
-        // Note: mtes are stored like [390, 380...]. We append them in that order (Time Ascending).
         combined_x_mte.push(...sessionData.mtes);
 
-        // Append Z-strips
         for (let i = 0; i < y_strikes.length; i++) {
             for (const strip of sessionData.strips) {
                 combined_z_values[i].push(strip[i] || 0);
@@ -159,18 +147,12 @@ export class HeatmapBuilderDO implements DurableObject {
         latestSession = sessionData;
       }
       
-      // 2. Append the FUTURE projection (Only for the latest session)
-      // Since the Worker sliced this perfectly, we just paste it on the end.
       if (latestSession && latestSession.future_x_mte && latestSession.future_x_mte.length > 0) {
-          
           combined_x_mte.push(...latestSession.future_x_mte);
-          
           for (let i = 0; i < y_strikes.length; i++) {
-              // Get the row for this strike from the future map
               const futureRow = latestSession.future_z_values[i] || [];
               combined_z_values[i].push(...futureRow);
           }
-          
           lastKnownSpot = latestSession.spot;
           lastKnownLimits = latestSession.limits;
       }
@@ -195,17 +177,44 @@ export class HeatmapBuilderDO implements DurableObject {
       });
     }
     
-    // --- ROUTE C: Delete Old Data ---
+    // --- ROUTE C: Smart Atomic Deletion ---
+    // Deletes any data older than DAYS_OF_DATA_TO_KEEP
     if (request.method === 'POST' && url.pathname === '/api/v1/deleteOldData') {
-        const endDate = getDateStr(DAYS_OF_DATA_TO_KEEP + 1, APP_TIMEZONE);
-        const oldKeys = await this.state.storage.list({
+        const listMap = await this.state.storage.list<SessionData>({
             prefix: `data_${TICKER}_`,
-            end: `data_${TICKER}_${endDate}T23:59:59Z`,
         });
-        if (oldKeys.size > 0) {
-            await this.state.storage.delete(Array.from(oldKeys.keys()));
+
+        const keysToDelete: string[] = [];
+        const now = new Date();
+        const cutoffTime = now.getTime() - (DAYS_OF_DATA_TO_KEEP * 24 * 60 * 60 * 1000);
+
+        for (const key of listMap.keys()) {
+            // Key: data_SPY_2023-10-25_mkt_open
+            const parts = key.split('_');
+            const dateStr = parts[2]; // 2023-10-25
+            
+            if (!dateStr) continue;
+
+            const keyDate = new Date(dateStr);
+            // If date is invalid or older than cutoff, mark for death
+            if (isNaN(keyDate.getTime()) || keyDate.getTime() < cutoffTime) {
+                keysToDelete.push(key);
+            }
         }
-        return new Response('Cleaned');
+
+        if (keysToDelete.length > 0) {
+            console.log(`Deleting ${keysToDelete.length} old keys:`, keysToDelete);
+            // ATOMIC DELETE: This removes all passed keys in one transaction.
+            await this.state.storage.delete(keysToDelete);
+            return new Response(`Deleted: ${keysToDelete.join(', ')}`);
+        }
+        return new Response('No old data to delete.');
+    }
+
+    // --- ROUTE D: THE NUKE (Clean Slate) ---
+    if (request.method === 'POST' && url.pathname === '/api/v1/nuke') {
+        await this.state.storage.deleteAll();
+        return new Response('DO Storage Nuked. Clean slate for tomorrow.');
     }
 
     return new Response('Not found', { status: 404 });
@@ -217,7 +226,6 @@ export interface Env {
   GEX_HISTORY_DO: DurableObjectNamespace;
 }
 
-// CORS Helpers
 const ALLOWED_ORIGIN = "*";
 function addCORSHeaders(response: Response): Response {
   const newResponse = new Response(response.body, response);
@@ -253,12 +261,34 @@ export default {
         return addCORSHeaders(await stub.fetch('https://dummy/api/v1/getChartData'));
       }
 
+      // --- NUKE ENDPOINT EXPOSED TO WORKER ---
+      // Use this once to clear your bad data: https://your-worker.dev/api/nuke
+      if (url.pathname === '/api/nuke') {
+        const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
+        const stub = env.GEX_HISTORY_DO.get(doId);
+        return await stub.fetch('https://dummy/api/v1/nuke', { method: 'POST' });
+      }
+
       if (url.pathname === '/api/get-ohlc') {
         const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
         const interval = url.searchParams.get('interval') || '5m';
         const { mkt_hours } = getMarketStatus(APP_TIMEZONE);
         const { ohlc, mktHoursRange } = await makeCS(ticker, interval, mkt_hours);
-        return addCORSHeaders(new Response(JSON.stringify({ ohlc, mktHoursRange }), {
+        
+        const ohlcTrace = {
+          type: 'candlestick', 
+          x: ohlc.x, 
+          open: ohlc.open, 
+          high: ohlc.high, 
+          low: ohlc.low, 
+          close: ohlc.close,
+          xaxis: 'x2', 
+          yaxis: 'y',  
+          increasing: { line: { color: '#26a69a' } },
+          decreasing: { line: { color: '#ef5350' } }
+        };
+
+        return addCORSHeaders(new Response(JSON.stringify({ ohlcTrace, mktHoursRange }), {
              headers: { 'Content-Type': 'application/json' } 
         }));
       }
@@ -272,49 +302,24 @@ export default {
   },
 
   async scheduled(controller: ScheduledController | null, env: Env, ctx: ExecutionContext): Promise<void> {
-      // 1. Check Market Status
       const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
       
-      if (mkt_hours === 'mkt_closed' || mkt_hours === 'post_mkt') {
-        // Optional: Run cleanup logic here if needed
-        return;
-      }
+      // Strict Check: Even if Cron fires, we exit if market is closed.
+      if (mkt_hours === 'mkt_closed') return;
       
-      // 2. Calculate Full Gamma Chart (History + Future)
-      // mte_list will be [390, 380, ... 0]
       const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
       const { df, spot } = await calc_gamma(TICKER, mte_list);
       const { limit_up, limit_down } = getChartLimits(df, mte_len);
       
-      // 3. IDENTIFY THE CURRENT STRIPE VS FUTURE
-      // We need to map "mins_passed" (time up) to "MTE" (time down).
-      // Example: mins_passed = 12. Round to 10. MTE = 390 - 10 = 380.
-      
-      // Round down to nearest 10-min bucket
       const current_bucket_mins = Math.round(mins_passed / 10) * 10;
-      
-      // Convert to MTE (Assuming 390 is start of day, 0 is end)
-      // Note: If you want 390 to be 9:30AM, use: target_mte = 390 - current_bucket_mins
       const target_mte = 390 - current_bucket_mins;
       
-      // Find where this MTE lives in the columns [390, 380 ... 0]
       const splitIndex = df.columns.indexOf(target_mte);
       
-      if (splitIndex === -1) {
-          console.log(`Current MTE ${target_mte} not found in columns. Likely pre/post market fringe. Skipping.`);
-          return;
-      }
+      if (splitIndex === -1) return;
 
-      // 4. PREPARE PAYLOAD
-      
-      // The Stripe: The single column at splitIndex
       const historical_z_strip = df.values.map(row => row[splitIndex]);
-
-      // The Future: Everything AFTER splitIndex (because columns are descending 390->0)
-      // If splitIndex is 1 (MTE 380), we want indices 2...end (MTE 370...0)
       const future_columns = df.columns.slice(splitIndex + 1);
-      
-      // We must slice every row in the 2D array
       const future_z_values = df.values.map(row => row.slice(splitIndex + 1));
 
       const stripData: NewStripData = {
@@ -331,7 +336,6 @@ export default {
         spot: spot,
       };
 
-      // 5. Send to DO
       const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
       const stub = env.GEX_HISTORY_DO.get(doId);
       
@@ -341,9 +345,9 @@ export default {
           headers: { 'Content-Type': 'application/json' },
       }));
 
-      // Cleanup trigger (Runs once at midnight)
+      // Cleanup trigger (Runs once at midnight local time)
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: APP_TIMEZONE }));
-      if (now.getHours() === 0 && now.getMinutes() < 5) {
+      if (now.getHours() === 0 && now.getMinutes() < 15) {
           ctx.waitUntil(stub.fetch('https://dummy/api/v1/deleteOldData', { method: 'POST' }));
       }
   },
