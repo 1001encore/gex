@@ -76,7 +76,6 @@ export class HeatmapBuilderDO implements DurableObject {
         future_z_values: []
       };
 
-      // Atomic Update: We modify the object in memory and save it once.
       if (!sessionData.mtes.includes(newData.historicalStrip.x_mte)) {
           sessionData.strips.push(newData.historicalStrip.z_strip);
           sessionData.mtes.push(newData.historicalStrip.x_mte);
@@ -95,9 +94,13 @@ export class HeatmapBuilderDO implements DurableObject {
       return new Response('OK');
     }
 
-    // --- ROUTE B: Get combined data (called by front-end) ---
+    // --- ROUTE B: Get Chart Data (Filtered by Date) ---
     if (request.method === 'GET' && url.pathname === '/api/v1/getChartData') {
-      // List all keys. We will filter them in memory to be safe.
+      const requestedDate = url.searchParams.get('date'); // YYYY-MM-DD
+      
+      // 1. Fetch ALL keys first to find available dates
+      // (Optimization: We could list with prefix if we knew the date, 
+      // but listing all keys for 3 days of data is very cheap/fast)
       const listMap = await this.state.storage.list<SessionData>({
         prefix: `data_${TICKER}_`,
       });
@@ -106,9 +109,20 @@ export class HeatmapBuilderDO implements DurableObject {
         return new Response(JSON.stringify({ error: 'No data available' }), { status: 404 });
       }
 
-      // Sort keys to ensure chronological order (Oldest -> Newest)
-      // Key format: data_SPY_YYYY-MM-DD_session
-      const sortedKeys = Array.from(listMap.keys()).sort();
+      // 2. Determine which date to show
+      // Extract unique dates from keys: data_SPY_2023-10-25_mkt_open
+      const allKeys = Array.from(listMap.keys()).sort();
+      const uniqueDates = [...new Set(allKeys.map(k => k.split('_')[2]))];
+      
+      // Default to the LATEST date if none provided
+      const targetDate = requestedDate || uniqueDates[uniqueDates.length - 1];
+
+      // 3. Filter keys for that specific date
+      const keysForDate = allKeys.filter(k => k.includes(targetDate));
+
+      if (keysForDate.length === 0) {
+         return new Response(JSON.stringify({ error: 'No data for date' }), { status: 404 });
+      }
 
       const combined_x_mte: number[] = [];
       const combined_z_values: number[][] = [];
@@ -119,11 +133,14 @@ export class HeatmapBuilderDO implements DurableObject {
       let y_strikes: number[] = [];
       let latestSession: SessionData | null = null;
 
-      for (const key of sortedKeys) {
+      // 4. Stitch sessions (Only for the target date)
+      for (const key of keysForDate) {
         const sessionData = listMap.get(key);
         if (!sessionData || !sessionData.mtes) continue;
         
         const sessionName = key.split('_').pop() || 'session'; 
+        
+        // Only add marker if we are appending a second session (e.g. post-market)
         if (combined_x_mte.length > 0) {
             sessionMarkers.push({
                 x: combined_x_mte[combined_x_mte.length - 1], 
@@ -143,10 +160,12 @@ export class HeatmapBuilderDO implements DurableObject {
                 combined_z_values[i].push(strip[i] || 0);
             }
         }
-        
         latestSession = sessionData;
       }
       
+      // 5. Append Future (only if viewing TODAY/Latest)
+      // If viewing a past date, we theoretically only want historical data.
+      // But for simplicity, if it's the latest session of that day, we show its future projection.
       if (latestSession && latestSession.future_x_mte && latestSession.future_x_mte.length > 0) {
           combined_x_mte.push(...latestSession.future_x_mte);
           for (let i = 0; i < y_strikes.length; i++) {
@@ -158,6 +177,7 @@ export class HeatmapBuilderDO implements DurableObject {
       }
 
       const payload = {
+        date: targetDate,
         heatmapTrace: {
           type: 'heatmap',
           x: combined_x_mte,
@@ -176,9 +196,20 @@ export class HeatmapBuilderDO implements DurableObject {
         headers: { 'Content-Type': 'application/json' },
       });
     }
+
+    // --- ROUTE E: Get Available Dates (For Dropdown) ---
+    if (request.method === 'GET' && url.pathname === '/api/v1/getAvailableDates') {
+        const listMap = await this.state.storage.list({ prefix: `data_${TICKER}_` });
+        const allKeys = Array.from(listMap.keys());
+        // Extract "2023-10-25" from "data_SPY_2023-10-25_mkt_open"
+        const uniqueDates = [...new Set(allKeys.map(k => k.split('_')[2]))].sort();
+        
+        return new Response(JSON.stringify(uniqueDates), {
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
     
     // --- ROUTE C: Smart Atomic Deletion ---
-    // Deletes any data older than DAYS_OF_DATA_TO_KEEP
     if (request.method === 'POST' && url.pathname === '/api/v1/deleteOldData') {
         const listMap = await this.state.storage.list<SessionData>({
             prefix: `data_${TICKER}_`,
@@ -189,30 +220,32 @@ export class HeatmapBuilderDO implements DurableObject {
         const cutoffTime = now.getTime() - (DAYS_OF_DATA_TO_KEEP * 24 * 60 * 60 * 1000);
 
         for (const key of listMap.keys()) {
-            // Key: data_SPY_2023-10-25_mkt_open
             const parts = key.split('_');
-            const dateStr = parts[2]; // 2023-10-25
-            
+            const dateStr = parts[2]; 
             if (!dateStr) continue;
-
             const keyDate = new Date(dateStr);
-            // If date is invalid or older than cutoff, mark for death
             if (isNaN(keyDate.getTime()) || keyDate.getTime() < cutoffTime) {
                 keysToDelete.push(key);
             }
         }
 
         if (keysToDelete.length > 0) {
-            console.log(`Deleting ${keysToDelete.length} old keys:`, keysToDelete);
-            // ATOMIC DELETE: This removes all passed keys in one transaction.
             await this.state.storage.delete(keysToDelete);
             return new Response(`Deleted: ${keysToDelete.join(', ')}`);
         }
         return new Response('No old data to delete.');
     }
 
-    // --- ROUTE D: THE NUKE (Clean Slate) ---
+    // --- ROUTE D: THE SECURE NUKE ---
     if (request.method === 'POST' && url.pathname === '/api/v1/nuke') {
+        // Retrieve the secret header passed from the Worker
+        const authHeader = request.headers.get("X-Admin-Secret");
+        
+        // Check against the stored secret (passed via constructor or handled in worker)
+        // Since DOs don't access `env` easily in `fetch`, we check this in the Worker layer 
+        // OR pass it down. 
+        // SIMPLER APPROACH: The Worker handles the Auth check before calling this DO method.
+        
         await this.state.storage.deleteAll();
         return new Response('DO Storage Nuked. Clean slate for tomorrow.');
     }
@@ -224,6 +257,7 @@ export class HeatmapBuilderDO implements DurableObject {
 // --- 2. THE WORKER ---
 export interface Env {
   GEX_HISTORY_DO: DurableObjectNamespace;
+  ADMIN_SECRET: string; // <--- NEW SECRET
 }
 
 const ALLOWED_ORIGIN = "*";
@@ -256,14 +290,34 @@ export default {
 
       if (url.pathname === '/api/get-gamma-api') {
         const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
+        const requestedDate = url.searchParams.get('date'); // New Param
+
         const doId = env.GEX_HISTORY_DO.idFromName(ticker);
         const stub = env.GEX_HISTORY_DO.get(doId);
-        return addCORSHeaders(await stub.fetch('https://dummy/api/v1/getChartData'));
+        
+        // Pass the date query to the DO
+        let doUrl = 'https://dummy/api/v1/getChartData';
+        if (requestedDate) doUrl += `?date=${requestedDate}`;
+
+        return addCORSHeaders(await stub.fetch(doUrl));
       }
 
-      // --- NUKE ENDPOINT EXPOSED TO WORKER ---
-      // Use this once to clear your bad data: https://your-worker.dev/api/nuke
+      // --- NEW: Expose Available Dates to Frontend ---
+      if (url.pathname === '/api/get-dates') {
+          const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
+          const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+          const stub = env.GEX_HISTORY_DO.get(doId);
+          return addCORSHeaders(await stub.fetch('https://dummy/api/v1/getAvailableDates'));
+      }
+
+      // --- SECURED NUKE ENDPOINT ---
       if (url.pathname === '/api/nuke') {
+        // 1. Check for the Secret Header
+        const providedSecret = request.headers.get("X-Admin-Secret");
+        if (providedSecret !== env.ADMIN_SECRET) {
+            return new Response("Unauthorized", { status: 401 });
+        }
+
         const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
         const stub = env.GEX_HISTORY_DO.get(doId);
         return await stub.fetch('https://dummy/api/v1/nuke', { method: 'POST' });
@@ -304,7 +358,6 @@ export default {
   async scheduled(controller: ScheduledController | null, env: Env, ctx: ExecutionContext): Promise<void> {
       const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
       
-      // Strict Check: Even if Cron fires, we exit if market is closed.
       if (mkt_hours === 'mkt_closed') return;
       
       const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
@@ -345,7 +398,6 @@ export default {
           headers: { 'Content-Type': 'application/json' },
       }));
 
-      // Cleanup trigger (Runs once at midnight local time)
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: APP_TIMEZONE }));
       if (now.getHours() === 0 && now.getMinutes() < 15) {
           ctx.waitUntil(stub.fetch('https://dummy/api/v1/deleteOldData', { method: 'POST' }));
