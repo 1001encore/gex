@@ -12,8 +12,7 @@ tag = "v1"
 new_sqlite_classes = [ "HeatmapBuilderDO" ]
 
 # --- OPTIMIZED CRON ---
-# Run every minute (*),
-# But ONLY during hours 11 through 23 UTC (approx 6am - 6pm EST),
-# And ONLY on Monday through Friday (1-5).
+# Run every 5 minutes, hours 13-21 UTC (covers US market hours in both EST/EDT)
+# Monday through Friday only.
 [triggers]
-crons = ["* 11-23 * * 1-5"]
+crons = ["*/5 13-21 * * 1-5"]

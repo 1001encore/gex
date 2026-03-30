@@ -20,18 +20,54 @@ let yahooAuth: { cookie: string | null; crumb: string | null; expiry: number } =
 const AUTH_TTL_MS = 15 * 60 * 1000;
 let authRefreshPromise: Promise<{ cookie: string; crumb: string }> | null = null;
 
+// backend/src/lib.ts
+
 export async function refreshYahooAuth(): Promise<{
   cookie: string;
   crumb: string;
 }> {
-  console.log('--- Starting new Yahoo auth refresh (v3)... ---');
-  
-  // Let's try to get the crumb AND cookies from the crumb endpoint directly
+  console.log('--- Starting new Yahoo auth refresh (v4) ---');
+
+  // 1. Fetch fc.yahoo.com to initialize the session (more reliable)
+  // We don't care about the body, just the set-cookie headers
+  const initRes = await fetch('https://fc.yahoo.com', {
+    headers: YF_HEADERS,
+    redirect: 'follow',
+  });
+
+  const setCookieHeaders: string[] = [];
+  initRes.headers.forEach((value, key) => {
+    if (key.toLowerCase() === 'set-cookie') {
+      setCookieHeaders.push(value.split(';')[0]);
+    }
+  });
+
+  // If fc.yahoo.com fails to set cookies, fallback to main page
+  if (setCookieHeaders.length === 0) {
+    console.log('fc.yahoo.com returned no cookies, trying finance.yahoo.com...');
+    const fallbackRes = await fetch('https://finance.yahoo.com/quote/SPY', {
+      headers: YF_HEADERS,
+      redirect: 'follow',
+    });
+    fallbackRes.headers.forEach((value, key) => {
+      if (key.toLowerCase() === 'set-cookie') {
+        setCookieHeaders.push(value.split(';')[0]);
+      }
+    });
+  }
+
+  if (setCookieHeaders.length === 0) {
+    throw new Error('Failed to get Yahoo cookies from both fc.yahoo.com and fallback.');
+  }
+
+  const cookie = setCookieHeaders.join('; ');
+  const headersWithFullCookie = { ...YF_HEADERS, Cookie: cookie };
+
+  // 2. Get the Crumb
   const crumbRes = await fetch(
     'https://query1.finance.yahoo.com/v1/test/getcrumb',
     {
-      headers: YF_HEADERS, // Send basic user-agent
-      redirect: 'follow',
+      headers: headersWithFullCookie,
     }
   );
 
@@ -39,24 +75,9 @@ export async function refreshYahooAuth(): Promise<{
     throw new Error(`Failed to get Yahoo crumb: ${crumbRes.statusText}`);
   }
 
-  // Get the cookies from this response
-  const setCookieHeaders: string[] = [];
-  crumbRes.headers.forEach((value, key) => {
-    if (key.toLowerCase() === 'set-cookie') {
-      setCookieHeaders.push(value.split(';')[0]); 
-    }
-  });
-
-  if (setCookieHeaders.length === 0) {
-    // This is a different error, so we'll know if this attempt failed
-    throw new Error('Crumb request succeeded but returned no cookies.');
-  }
-  
-  const cookie = setCookieHeaders.join('; ');
   const crumb = await crumbRes.text();
   if (!crumb) throw new Error('Crumb response was empty.');
 
-  // Save the new auth details
   const newAuth = { cookie, crumb };
   yahooAuth = { ...newAuth, expiry: Date.now() + AUTH_TTL_MS };
   console.log('--- Successfully refreshed Yahoo auth. ---');
@@ -82,15 +103,15 @@ export async function getYahooAuth(): Promise<{ cookie: string; crumb: string }>
   }
 }
 
-// --- NEW HELPER FUNCTION ---
 /**
  * Generates the standardized storage key for the DO.
- * @param timeZone The app's timeZone (e.g., 'Asia/Istanbul')
+ * @param ticker The stock ticker (e.g. 'SPY')
+ * @param timeZone The app's timezone (e.g., 'America/New_York')
  * @returns { key: string, session: string }
  */
-export function getStorageKey(timeZone: string): { key: string, session: string } {
+export function getStorageKey(ticker: string, timeZone: string): { key: string, session: string } {
   const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
-  
+
   // Get YYYY-MM-DD
   const year = now.getFullYear();
   const month = (now.getMonth() + 1).toString().padStart(2, '0');
@@ -101,7 +122,7 @@ export function getStorageKey(timeZone: string): { key: string, session: string 
 
   // Key format: data_TICKER_YYYY-MM-DD_SESSION
   return {
-    key: `data_SPY_${dateStr}_${mkt_hours}`,
+    key: `data_${ticker.toUpperCase()}_${dateStr}_${mkt_hours}`,
     session: mkt_hours
   };
 }
@@ -113,13 +134,13 @@ export function getStorageKey(timeZone: string): { key: string, session: string 
  * @returns YYYY-MM-DD string
  */
 export function getDateStr(daysAgo: number, timeZone: string): string {
-    const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
-    now.setDate(now.getDate() - daysAgo);
-    
-    const year = now.getFullYear();
-    const month = (now.getMonth() + 1).toString().padStart(2, '0');
-    const day = now.getDate().toString().padStart(2, '0');
-    return `${year}-${month}-${day}`;
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
+  now.setDate(now.getDate() - daysAgo);
+
+  const year = now.getFullYear();
+  const month = (now.getMonth() + 1).toString().padStart(2, '0');
+  const day = now.getDate().toString().padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 export function getMarketStatus(timeZone: string): {
@@ -142,54 +163,32 @@ export function getMarketStatus(timeZone: string): {
     (nowInTZ.getTime() - mktOpenInTZ.getTime()) / 60000
   );
 
-  // --- NEW, CORRECTED LOGIC ---
+  // Options market is only open during regular hours (6.5h = 390 mins)
   if (dayOfWeek === 0 || dayOfWeek === 6)
     return { mkt_hours: 'mkt_closed', mins_passed };
 
-  // 16:30 - 00:00 (7.5 hours = 450 mins)
-  if (mins_passed >= 0 && mins_passed <= 450)
+  if (mins_passed >= 0 && mins_passed <= 390)
     return { mkt_hours: 'mkt_open', mins_passed };
 
-  // 00:00 - 04:00 (4 hours = 240 mins). We'll keep a 4-hour post-market.
-  if (mins_passed > 450 && mins_passed <= 690) // 450 + 240 = 690
-    return { mkt_hours: 'post_mkt', mins_passed };
-  
-  // 1110 is 16:30 - 5.5h (11:00). We keep the pre-market logic the same.
-  if (mins_passed >= 1110 && mins_passed <= 1440)
-    return { mkt_hours: 'pre_mkt', mins_passed };
-  
-  // All other times are closed
   return { mkt_hours: 'mkt_closed', mins_passed };
 }
 
-export function getMteList(mkt_hours: string, mins_passed: number, interval = 10) {
-  const max_mkt_mins: Record<string, number> = {
-    mkt_open: 390,
-    pre_mkt: 330,
-    post_mkt: 240,
-    mkt_closed: 960,
-  };
-
-  const max_time = max_mkt_mins[mkt_hours];
-  
-  // If market is open, we ALWAYS return the full day grid [390, 380... 0]
-  // The worker will decide which column is "now".
+export function getMteList(mkt_hours: string, mins_passed: number, interval = 1) {
+  // Market open: full 390-minute grid [390, 389, ..., 0]
   if (mkt_hours === 'mkt_open') {
-      const parts = Math.floor(390 / interval) + 1; 
-      return { 
-          mte_list: Array.from({ length: parts }, (_, i) => 390 - (i * interval)),
-          mte_len: parts 
-      };
+    const parts = Math.floor(390 / interval) + 1;
+    return {
+      mte_list: Array.from({ length: parts }, (_, i) => 390 - (i * interval)),
+      mte_len: parts,
+    };
   }
 
-  // Fallback for pre/post market logic (existing logic)
+  // Closed: show full day grid for display purposes
+  const max_time = 960;
   const parts = Math.floor(max_time / interval) + 1;
   const mte_list = Array.from({ length: parts }, (_, i) => max_time - (i * interval));
-  
-  // Clean up negatives
   while (mte_list.length > 0 && mte_list[mte_list.length - 1] < 0) mte_list.pop();
   if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) mte_list.push(0);
-  
   return { mte_list, mte_len: mte_list.length };
 }
 
@@ -420,7 +419,7 @@ export async function makeCS(ticker: string, interval: string, mkt_hours: string
   const { cookie, crumb } = await getYahooAuth();
   // Keep range=2d, it helps provide enough data
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=2d&interval=${interval}&includePrePost=true&crumb=${crumb}`;
-  
+
   const res = await fetch(url, {
     headers: {
       ...YF_HEADERS,
@@ -450,49 +449,25 @@ export async function makeCS(ticker: string, interval: string, mkt_hours: string
   }
 
   const open_slicer: Record<string, number> = { "1m": 308, "2m": 157, "5m": 63, "15m": 21, "30m": 11 };
-  const post_slicer: Record<string, number> = { "1m": 702, "2m": 353, "5m": 141, "15m": 47, "30m": 24 };
-  const pre_max_cs: Record<string, number> = { "1m": 330, "2m": 165, "5m": 66, "15m": 22, "30m": 11 };
   const open_max_cs: Record<string, number> = { "1m": 390, "2m": 195, "5m": 78, "15m": 26, "30m": 13 };
-  const post_max_cs: Record<string, number> = { "1m": 240, "2m": 120, "5m": 48, "15m": 16, "30m": 8 };
   const closed_max_cs: Record<string, number> = { "1m": 960, "2m": 480, "5m": 192, "15m": 64, "30m": 32 };
-  
+
   let range_start = 0;
-  let max_cs = 0;
   let sliced_quotes = valid_quotes;
 
-// --- ADD SAFETY CHECKS TO SLICING LOGIC ---
-  if (mkt_hours === 'pre_mkt') {
-    range_start = 330;
-    max_cs = pre_max_cs[interval];
-    sliced_quotes = valid_quotes.slice(0, max_cs + 1);
-  } else if (mkt_hours === 'mkt_open') {
+  if (mkt_hours === 'mkt_open') {
     range_start = 390;
-    max_cs = open_max_cs[interval];
-    
     let slice_start = open_slicer[interval];
     if (slice_start >= valid_quotes.length) {
-        console.warn(`OHLC 'mkt_open' slicer index ${slice_start} out of bounds. Using all ${valid_quotes.length} quotes.`);
-        slice_start = 0; // Use all data
+      console.warn(`OHLC slicer index ${slice_start} out of bounds. Using all ${valid_quotes.length} quotes.`);
+      slice_start = 0;
     }
     sliced_quotes = valid_quotes.slice(slice_start);
-
-  } else if (mkt_hours === 'post_mkt') {
-    range_start = 240;
-    max_cs = post_max_cs[interval];
-    
-    let slice_start = post_slicer[interval];
-    if (slice_start >= valid_quotes.length) {
-        console.warn(`OHLC 'post_mkt' slicer index ${slice_start} out of bounds. Using all ${valid_quotes.length} quotes.`);
-        slice_start = 0; // Use all data
-    }
-    sliced_quotes = valid_quotes.slice(slice_start);
-
-  } else if (mkt_hours === 'mkt_closed') {
+  } else {
+    // mkt_closed — show full available data
     range_start = 960;
-    max_cs = closed_max_cs[interval];
     sliced_quotes = valid_quotes;
   }
-  // --- END OF SAFETY CHECKS ---
 
   // Safety for the x-axis calculation
   const x_axis_mte = Array.from(
@@ -507,12 +482,12 @@ export async function makeCS(ticker: string, interval: string, mkt_hours: string
     low: sliced_quotes.map(q => q.low),
     close: sliced_quotes.map(q => q.close),
   };
-  
+
   // If we ended up with no data, return empty arrays but don't crash
   if (sliced_quotes.length === 0) {
-      console.error("OHLC slicing resulted in 0 quotes. Returning empty chart.");
-      return { ohlc: { x: [], open: [], high: [], low: [], close: [] }, mktHoursRange: [range_start, 0] };
+    console.error("OHLC slicing resulted in 0 quotes. Returning empty chart.");
+    return { ohlc: { x: [], open: [], high: [], low: [], close: [] }, mktHoursRange: [range_start, 0] };
   }
-  
+
   return { ohlc, mktHoursRange: [range_start, 0] };
 }

@@ -1,4 +1,0 @@
-name = "1001terminal"
-
-[pages]
-compatibility_flags = ["nodejs_compat"]
