@@ -12,6 +12,7 @@ import {
 
 import {
   calc_exposure,
+  calc_expiry_matrix,
   ExposureMode,
   getMteList,
   getMarketStatus,
@@ -26,6 +27,7 @@ const APP_TIMEZONE = 'America/New_York';
 const DAYS_OF_DATA_TO_KEEP = 20;
 const TICKER = 'SPY';
 const SCHEDULED_TICKERS = ['SPY', 'QQQ', '^SPX'];
+const DEFAULT_EXPIRATIONS = 3;
 
 // --- INTERFACES ---
 interface SessionData {
@@ -107,7 +109,7 @@ export function normalizeDays(input: string | null): number {
 
 export function normalizeExpirations(input: string | null): number {
   const expirations = Number(input || '3');
-  if (!Number.isInteger(expirations) || expirations < 1 || expirations > 12) {
+  if (!Number.isInteger(expirations) || expirations < 1 || expirations > 30) {
     throw new Error('Invalid expirations');
   }
   return expirations;
@@ -233,6 +235,30 @@ export function summarizeConfluence(payload: ChartPayload) {
     bias,
     upsideMass,
     downsideMass,
+  };
+}
+
+function buildHistoryMatrixFromPayload(payload: ChartPayload) {
+  const x = payload.heatmapTrace.x || [];
+  const y = payload.heatmapTrace.y || [];
+  const z = payload.heatmapTrace.z || [];
+  const segments = payload.daySegments?.length
+    ? payload.daySegments
+    : [{ date: payload.date, start: 0, end: x.length - 1 }];
+
+  const columns = segments.map((segment) => segment.date);
+  const values = y.map((_, rowIndex) =>
+    segments.map((segment) => z[rowIndex]?.[segment.end] || 0)
+  );
+
+  return {
+    ticker: '',
+    mode: payload.mode || 'gex',
+    spot: payload.spot,
+    strikes: y,
+    columns,
+    values,
+    source: 'history',
   };
 }
 
@@ -630,7 +656,7 @@ export default {
       if (url.pathname === '/api/live-exposure') {
         const ticker = normalizeTicker(url.searchParams.get('ticker'));
         const mode = normalizeMode(url.searchParams.get('mode'));
-        const expirations = normalizeExpirations(url.searchParams.get('expirations'));
+        const expirations = DEFAULT_EXPIRATIONS;
         const currentOnly = url.searchParams.get('currentOnly') === 'true';
         const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
         const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
@@ -656,6 +682,33 @@ export default {
         };
 
         return addCORSHeaders(new Response(JSON.stringify(payload), {
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+
+      if (url.pathname === '/api/future-matrix') {
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const mode = normalizeMode(url.searchParams.get('mode'));
+        const expirations = normalizeExpirations(url.searchParams.get('horizon'));
+        const matrix = await calc_expiry_matrix(ticker, { mode, expirations });
+        return addCORSHeaders(new Response(JSON.stringify({ ...matrix, source: 'future' }), {
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+
+      if (url.pathname === '/api/history-matrix') {
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const mode = normalizeMode(url.searchParams.get('mode'));
+        const requestedDate = normalizeDate(url.searchParams.get('date'));
+        const days = normalizeDays(url.searchParams.get('days'));
+        const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+        const stub = env.GEX_HISTORY_DO.get(doId);
+        let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}&includeFuture=false`;
+        if (requestedDate) doUrl += `&date=${requestedDate}`;
+        const response = await stub.fetch(doUrl);
+        if (!response.ok) return addCORSHeaders(response);
+        const payload = (await response.json()) as ChartPayload;
+        return addCORSHeaders(new Response(JSON.stringify({ ...buildHistoryMatrixFromPayload(payload), ticker }), {
           headers: { 'Content-Type': 'application/json' },
         }));
       }
@@ -734,7 +787,7 @@ export default {
     for (const ticker of SCHEDULED_TICKERS) {
       for (const mode of ['gex', 'vex'] as ExposureMode[]) {
         try {
-          const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations: 1 });
+          const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations: DEFAULT_EXPIRATIONS });
           const { limit_up, limit_down } = getChartLimits(df, mte_len);
 
           const splitIndex = df.columns.indexOf(target_mte);

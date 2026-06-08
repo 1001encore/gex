@@ -226,6 +226,83 @@ async function calc_exposure(ticker, mte_list, options = {}) {
   });
   return { df, spot };
 }
+async function calc_expiry_matrix(ticker, options = {}) {
+  const mode = options.mode || "gex";
+  const expirationCount = Math.max(1, Math.min(30, options.expirations || 3));
+  const now = options.now || /* @__PURE__ */ new Date();
+  const { cookie, crumb } = await getYahooAuth();
+  const authedHeaders = { ...YF_HEADERS, Cookie: cookie };
+  const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=5m&crumb=${crumb}`;
+  const chartRes = await fetch(chartUrl, { headers: authedHeaders });
+  if (!chartRes.ok) {
+    if (chartRes.status === 401 || chartRes.status === 403) yahooAuth.expiry = 0;
+    throw new Error(`Failed to fetch chart/spot price: ${chartRes.status}`);
+  }
+  const chartJson = await chartRes.json();
+  const spot = chartJson?.chart?.result?.[0]?.meta?.regularMarketPrice;
+  if (!spot) throw new Error(`Could not get spot price for ${ticker} from chart API`);
+  const optionsUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?crumb=${crumb}`;
+  const optionsRes = await fetch(optionsUrl, { headers: authedHeaders });
+  if (!optionsRes.ok) {
+    if (optionsRes.status === 401 || optionsRes.status === 403) yahooAuth.expiry = 0;
+    throw new Error(`Failed to fetch options dates: ${optionsRes.status}`);
+  }
+  const optionsJson = await optionsRes.json();
+  const expirationDates = optionsJson?.optionChain?.result?.[0]?.expirationDates?.slice(0, expirationCount) || [];
+  if (expirationDates.length === 0) throw new Error(`Could not get expiration dates for ${ticker}`);
+  const exposureByStrike = {};
+  const allStrikes = /* @__PURE__ */ new Set();
+  for (let columnIndex = 0; columnIndex < expirationDates.length; columnIndex++) {
+    const expiration = expirationDates[columnIndex];
+    const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${expiration}&crumb=${crumb}`;
+    const chainRes = await fetch(chainUrl, { headers: authedHeaders });
+    if (!chainRes.ok) {
+      if (chainRes.status === 401 || chainRes.status === 403) yahooAuth.expiry = 0;
+      throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
+    }
+    const chainJson = await chainRes.json();
+    const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
+    if (!chain || !chain.calls || !chain.puts) {
+      throw new Error(`Could not fetch options chain for ${ticker}`);
+    }
+    for (const contract of [...chain.calls, ...chain.puts]) {
+      if (!contract.strike) continue;
+      allStrikes.add(contract.strike);
+      exposureByStrike[contract.strike] ||= expirationDates.map(() => 0);
+    }
+    for (const contract of chain.calls) {
+      if (!contract.strike) continue;
+      exposureByStrike[contract.strike][columnIndex] += calcContractExposure(
+        mode,
+        "call",
+        spot,
+        contract.strike,
+        getMinutesToExpiration(expiration, now, 0),
+        contract
+      );
+    }
+    for (const contract of chain.puts) {
+      if (!contract.strike) continue;
+      exposureByStrike[contract.strike][columnIndex] += calcContractExposure(
+        mode,
+        "put",
+        spot,
+        contract.strike,
+        getMinutesToExpiration(expiration, now, 0),
+        contract
+      );
+    }
+  }
+  const strikes = Array.from(allStrikes).sort((a, b) => b - a);
+  return {
+    ticker,
+    mode,
+    spot,
+    strikes,
+    columns: expirationDates.map((expiration) => new Date(expiration * 1e3).toISOString().slice(0, 10)),
+    values: strikes.map((strike) => (exposureByStrike[strike] || expirationDates.map(() => 0)).map((value) => Math.round(value * 10) / 10))
+  };
+}
 function getMinutesToExpiration(expirationTimestampSeconds, now, projectedMinutesElapsed) {
   const expirationMs = expirationTimestampSeconds * 1e3;
   const projectedNowMs = now.getTime() + projectedMinutesElapsed * 6e4;
@@ -369,6 +446,7 @@ var APP_TIMEZONE = "America/New_York";
 var DAYS_OF_DATA_TO_KEEP = 20;
 var TICKER = "SPY";
 var SCHEDULED_TICKERS = ["SPY", "QQQ", "^SPX"];
+var DEFAULT_EXPIRATIONS = 3;
 function normalizeTicker(input) {
   const ticker = (input || TICKER).trim().toUpperCase();
   if (!/^[A-Z0-9.^-]{1,12}$/.test(ticker)) {
@@ -403,7 +481,7 @@ function normalizeDays(input) {
 }
 function normalizeExpirations(input) {
   const expirations = Number(input || "3");
-  if (!Number.isInteger(expirations) || expirations < 1 || expirations > 12) {
+  if (!Number.isInteger(expirations) || expirations < 1 || expirations > 30) {
     throw new Error("Invalid expirations");
   }
   return expirations;
@@ -505,6 +583,25 @@ function summarizeConfluence(payload) {
     bias,
     upsideMass,
     downsideMass
+  };
+}
+function buildHistoryMatrixFromPayload(payload) {
+  const x = payload.heatmapTrace.x || [];
+  const y = payload.heatmapTrace.y || [];
+  const z = payload.heatmapTrace.z || [];
+  const segments = payload.daySegments?.length ? payload.daySegments : [{ date: payload.date, start: 0, end: x.length - 1 }];
+  const columns = segments.map((segment) => segment.date);
+  const values = y.map(
+    (_, rowIndex) => segments.map((segment) => z[rowIndex]?.[segment.end] || 0)
+  );
+  return {
+    ticker: "",
+    mode: payload.mode || "gex",
+    spot: payload.spot,
+    strikes: y,
+    columns,
+    values,
+    source: "history"
   };
 }
 function isAuthorizedCron(request, env) {
@@ -799,7 +896,7 @@ var index_default = {
       if (url.pathname === "/api/live-exposure") {
         const ticker = normalizeTicker(url.searchParams.get("ticker"));
         const mode = normalizeMode(url.searchParams.get("mode"));
-        const expirations = normalizeExpirations(url.searchParams.get("expirations"));
+        const expirations = DEFAULT_EXPIRATIONS;
         const currentOnly = url.searchParams.get("currentOnly") === "true";
         const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
         const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
@@ -824,6 +921,31 @@ var index_default = {
           daySegments: [{ date: getDateStr(0, APP_TIMEZONE), start: 0, end: liveColumns.length - 1 }]
         };
         return addCORSHeaders(new Response(JSON.stringify(payload), {
+          headers: { "Content-Type": "application/json" }
+        }));
+      }
+      if (url.pathname === "/api/future-matrix") {
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const mode = normalizeMode(url.searchParams.get("mode"));
+        const expirations = normalizeExpirations(url.searchParams.get("horizon"));
+        const matrix = await calc_expiry_matrix(ticker, { mode, expirations });
+        return addCORSHeaders(new Response(JSON.stringify({ ...matrix, source: "future" }), {
+          headers: { "Content-Type": "application/json" }
+        }));
+      }
+      if (url.pathname === "/api/history-matrix") {
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const mode = normalizeMode(url.searchParams.get("mode"));
+        const requestedDate = normalizeDate(url.searchParams.get("date"));
+        const days = normalizeDays(url.searchParams.get("days"));
+        const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+        const stub = env.GEX_HISTORY_DO.get(doId);
+        let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}&includeFuture=false`;
+        if (requestedDate) doUrl += `&date=${requestedDate}`;
+        const response = await stub.fetch(doUrl);
+        if (!response.ok) return addCORSHeaders(response);
+        const payload = await response.json();
+        return addCORSHeaders(new Response(JSON.stringify({ ...buildHistoryMatrixFromPayload(payload), ticker }), {
           headers: { "Content-Type": "application/json" }
         }));
       }
@@ -888,7 +1010,7 @@ var index_default = {
     for (const ticker of SCHEDULED_TICKERS) {
       for (const mode of ["gex", "vex"]) {
         try {
-          const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations: 1 });
+          const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations: DEFAULT_EXPIRATIONS });
           const { limit_up, limit_down } = getChartLimits(df, mte_len);
           const splitIndex = df.columns.indexOf(target_mte);
           if (splitIndex === -1) {

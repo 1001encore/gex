@@ -241,6 +241,15 @@ export interface ExposureOptions {
   now?: Date;
 }
 
+export interface ExposureMatrix {
+  ticker: string;
+  mode: ExposureMode;
+  spot: number;
+  strikes: number[];
+  columns: string[];
+  values: number[][];
+}
+
 export async function calc_gamma(
   ticker: string,
   mte_list: number[],
@@ -337,6 +346,95 @@ export async function calc_exposure(
     df.values.push((exposureByStrike[strike] || mte_list.map(() => 0)).map((value) => Math.round(value * 10) / 10));
   });
   return { df, spot };
+}
+
+export async function calc_expiry_matrix(
+  ticker: string,
+  options: ExposureOptions = {}
+): Promise<ExposureMatrix> {
+  const mode = options.mode || 'gex';
+  const expirationCount = Math.max(1, Math.min(30, options.expirations || 3));
+  const now = options.now || new Date();
+  const { cookie, crumb } = await getYahooAuth();
+  const authedHeaders = { ...YF_HEADERS, Cookie: cookie! };
+
+  const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=5m&crumb=${crumb}`;
+  const chartRes = await fetch(chartUrl, { headers: authedHeaders });
+  if (!chartRes.ok) {
+    if (chartRes.status === 401 || chartRes.status === 403) yahooAuth.expiry = 0;
+    throw new Error(`Failed to fetch chart/spot price: ${chartRes.status}`);
+  }
+  const chartJson = (await chartRes.json()) as any;
+  const spot = chartJson?.chart?.result?.[0]?.meta?.regularMarketPrice;
+  if (!spot) throw new Error(`Could not get spot price for ${ticker} from chart API`);
+
+  const optionsUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?crumb=${crumb}`;
+  const optionsRes = await fetch(optionsUrl, { headers: authedHeaders });
+  if (!optionsRes.ok) {
+    if (optionsRes.status === 401 || optionsRes.status === 403) yahooAuth.expiry = 0;
+    throw new Error(`Failed to fetch options dates: ${optionsRes.status}`);
+  }
+  const optionsJson = (await optionsRes.json()) as any;
+  const expirationDates: number[] =
+    optionsJson?.optionChain?.result?.[0]?.expirationDates?.slice(0, expirationCount) || [];
+  if (expirationDates.length === 0) throw new Error(`Could not get expiration dates for ${ticker}`);
+
+  const exposureByStrike: Record<string, number[]> = {};
+  const allStrikes = new Set<number>();
+
+  for (let columnIndex = 0; columnIndex < expirationDates.length; columnIndex++) {
+    const expiration = expirationDates[columnIndex];
+    const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${expiration}&crumb=${crumb}`;
+    const chainRes = await fetch(chainUrl, { headers: authedHeaders });
+    if (!chainRes.ok) {
+      if (chainRes.status === 401 || chainRes.status === 403) yahooAuth.expiry = 0;
+      throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
+    }
+    const chainJson = (await chainRes.json()) as any;
+    const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
+    if (!chain || !chain.calls || !chain.puts) {
+      throw new Error(`Could not fetch options chain for ${ticker}`);
+    }
+
+    for (const contract of [...chain.calls, ...chain.puts]) {
+      if (!contract.strike) continue;
+      allStrikes.add(contract.strike);
+      exposureByStrike[contract.strike] ||= expirationDates.map(() => 0);
+    }
+
+    for (const contract of chain.calls) {
+      if (!contract.strike) continue;
+      exposureByStrike[contract.strike][columnIndex] += calcContractExposure(
+        mode,
+        'call',
+        spot,
+        contract.strike,
+        getMinutesToExpiration(expiration, now, 0),
+        contract
+      );
+    }
+    for (const contract of chain.puts) {
+      if (!contract.strike) continue;
+      exposureByStrike[contract.strike][columnIndex] += calcContractExposure(
+        mode,
+        'put',
+        spot,
+        contract.strike,
+        getMinutesToExpiration(expiration, now, 0),
+        contract
+      );
+    }
+  }
+
+  const strikes = Array.from(allStrikes).sort((a, b) => b - a);
+  return {
+    ticker,
+    mode,
+    spot,
+    strikes,
+    columns: expirationDates.map((expiration) => new Date(expiration * 1000).toISOString().slice(0, 10)),
+    values: strikes.map((strike) => (exposureByStrike[strike] || expirationDates.map(() => 0)).map((value) => Math.round(value * 10) / 10)),
+  };
 }
 
 function getMinutesToExpiration(expirationTimestampSeconds: number, now: Date, projectedMinutesElapsed: number): number {

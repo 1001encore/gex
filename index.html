@@ -393,13 +393,16 @@
             </div>
 
             <div class="control-group">
-                <label for="expirations">Expiries</label>
-                <input id="expirations" type="number" min="1" max="12" value="1">
+                <label for="viewMode">View</label>
+                <select id="viewMode">
+                    <option value="future" selected>Today/Future</option>
+                    <option value="history">History</option>
+                </select>
             </div>
 
             <div class="control-group">
-                <label for="days">History Days</label>
-                <input id="days" type="number" min="1" max="10" value="1">
+                <label for="horizon">Horizon / Sessions</label>
+                <input id="horizon" type="number" min="1" max="30" value="3">
             </div>
 
             <div class="control-group">
@@ -432,7 +435,7 @@
         <div id="loading">Loading table data...</div>
         <div class="note">
             Cells display absolute observed gamma magnitude. Sign is retained by color: green is positive, red is negative.
-            Expiries controls how many option expirations feed the current map. History Days controls how many stored trading days are used for replay/change context.
+            Today/Future columns are upcoming expiries. History columns are stored trading sessions. Columns are shown separately, not merged.
         </div>
     </div>
 
@@ -440,8 +443,8 @@
         const tickerInput = document.getElementById('ticker');
         const dateSelect = document.getElementById('dateSelect');
         const modeSelect = document.getElementById('mode');
-        const expirationsInput = document.getElementById('expirations');
-        const daysInput = document.getElementById('days');
+        const viewModeSelect = document.getElementById('viewMode');
+        const horizonInput = document.getElementById('horizon');
         const columnStepSelect = document.getElementById('columnStep');
         const confluenceTickersInput = document.getElementById('confluenceTickers');
         const trinityGrid = document.getElementById('trinityGrid');
@@ -458,20 +461,26 @@
             return tickerInput.value || 'SPY';
         }
 
+        function getHorizon() {
+            const horizon = Math.max(1, Math.min(30, Number(horizonInput.value || 3)));
+            horizonInput.value = String(horizon);
+            return horizon;
+        }
+
         function getDays() {
-            const days = Math.max(1, Math.min(10, Number(daysInput.value || 1)));
-            daysInput.value = String(days);
-            return days;
+            return getHorizon();
         }
 
         function getExpirations() {
-            const expirations = Math.max(1, Math.min(12, Number(expirationsInput.value || 3)));
-            expirationsInput.value = String(expirations);
-            return expirations;
+            return getHorizon();
         }
 
         function getMode() {
             return modeSelect.value;
+        }
+
+        function getViewMode() {
+            return viewModeSelect.value;
         }
 
         function setStatus(message) {
@@ -851,6 +860,61 @@
             setStatus(`${tickers[0]} ${getMode().toUpperCase()} current map · 0DTE-first`);
         }
 
+        function renderMatrix(matrix) {
+            const maxAbs = matrix.values.flat().reduce((max, value) => Math.max(max, Math.abs(value || 0)), 0);
+            const spot = Number(matrix.spot || 0);
+            const closestSpotStrike = matrix.strikes
+                .slice()
+                .sort((a, b) => Math.abs(a - spot) - Math.abs(b - spot))[0];
+            let html = '<table><thead><tr>';
+            html += '<th class="strike-col">Strike</th>';
+            for (const column of matrix.columns) {
+                html += `<th class="mte-header">${column}</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            for (let rowIndex = 0; rowIndex < matrix.strikes.length; rowIndex++) {
+                const strike = matrix.strikes[rowIndex];
+                const row = matrix.values[rowIndex] || [];
+                html += '<tr>';
+                html += `<th class="strike-col ${strike === closestSpotStrike ? 'spot-row' : ''}">${strike}</th>`;
+                for (const value of row) {
+                    const cellClass = value > 0 ? 'cell-pos' : value < 0 ? 'cell-neg' : 'empty';
+                    html += `<td class="${cellClass}" style="${getCellStyle(value, maxAbs)}">${formatSigned(value || 0)}</td>`;
+                }
+                html += '</tr>';
+            }
+
+            html += '</tbody></table>';
+            tableWrap.innerHTML = html;
+            tableWrap.style.display = 'block';
+            trinityGrid.style.display = 'none';
+            document.getElementById('nodeDashboard').style.display = 'none';
+            document.getElementById('nodeList').style.display = 'none';
+            document.getElementById('confluenceList').style.display = 'none';
+            setLoading(false);
+            setLastUpdated();
+            setStatus(`${matrix.ticker} ${matrix.mode.toUpperCase()} ${matrix.source} matrix - ${matrix.columns.length} columns`);
+        }
+
+        async function fetchMatrix(requestId = activeRequestId) {
+            const ticker = getTicker();
+            const mode = getMode();
+            const horizon = getHorizon();
+            const viewMode = getViewMode();
+            const date = dateSelect.value;
+            const url = viewMode === 'future'
+                ? `${WORKER_URL}/api/future-matrix?ticker=${encodeURIComponent(ticker)}&mode=${mode}&horizon=${horizon}`
+                : `${WORKER_URL}/api/history-matrix?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${horizon}${date && date !== 'LIVE' ? `&date=${encodeURIComponent(date)}` : ''}`;
+            try {
+                const matrix = await fetchJson(url);
+                if (requestId !== activeRequestId) return;
+                renderMatrix(matrix);
+            } catch (error) {
+                if (requestId === activeRequestId) showError(`${viewMode} matrix failed: ${error.message}`);
+            }
+        }
+
         async function renderConfluence(date, requestId) {
             const mode = getMode();
             const days = getDays();
@@ -990,8 +1054,10 @@
 
         function setLoading(isLoading) {
             loadingDiv.style.display = isLoading ? 'block' : 'none';
-            tableWrap.style.display = isLoading ? 'none' : 'block';
-            trinityGrid.style.display = isLoading ? 'none' : 'grid';
+            if (isLoading) {
+                tableWrap.style.display = 'none';
+                trinityGrid.style.display = 'none';
+            }
         }
 
         function startApp() {
@@ -1003,16 +1069,16 @@
 
             if (gammaTimer) clearInterval(gammaTimer);
 
-            fetchTrinity(requestId);
-            gammaTimer = setInterval(() => fetchTrinity(requestId), 60 * 1000);
+            fetchMatrix(requestId);
+            gammaTimer = setInterval(() => fetchMatrix(requestId), 60 * 1000);
         }
 
         tickerInput.addEventListener('change', fetchAvailableDates);
         modeSelect.addEventListener('change', fetchAvailableDates);
+        viewModeSelect.addEventListener('change', startApp);
         dateSelect.addEventListener('change', startApp);
-        expirationsInput.addEventListener('change', startApp);
-        daysInput.addEventListener('change', startApp);
-        columnStepSelect.addEventListener('change', () => fetchTrinity(activeRequestId));
+        horizonInput.addEventListener('change', startApp);
+        columnStepSelect.addEventListener('change', () => fetchMatrix(activeRequestId));
         confluenceTickersInput.addEventListener('change', startApp);
 
         document.addEventListener('DOMContentLoaded', fetchAvailableDates);
