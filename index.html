@@ -143,7 +143,8 @@
         }
         .trinity-grid {
             display: grid;
-            grid-template-columns: repeat(3, minmax(260px, 1fr));
+            grid-template-columns: minmax(320px, 760px);
+            justify-content: center;
             gap: 12px;
             margin-bottom: 14px;
         }
@@ -369,7 +370,11 @@
         <div class="controls">
             <div class="control-group">
                 <label for="ticker">Ticker</label>
-                <input id="ticker" type="text" value="SPY">
+                <select id="ticker">
+                    <option value="^SPX">^SPX</option>
+                    <option value="SPY" selected>SPY</option>
+                    <option value="QQQ">QQQ</option>
+                </select>
             </div>
 
             <div class="control-group">
@@ -388,12 +393,12 @@
             </div>
 
             <div class="control-group">
-                <label for="expirations">Expirations</label>
+                <label for="expirations">Expiries</label>
                 <input id="expirations" type="number" min="1" max="12" value="1">
             </div>
 
             <div class="control-group">
-                <label for="days">Days</label>
+                <label for="days">History Days</label>
                 <input id="days" type="number" min="1" max="10" value="1">
             </div>
 
@@ -409,7 +414,7 @@
                 </select>
             </div>
 
-            <div class="control-group">
+            <div class="control-group" style="display:none">
                 <label for="confluenceTickers">Panels</label>
                 <input id="confluenceTickers" type="text" value="^SPX,SPY,QQQ">
             </div>
@@ -427,7 +432,7 @@
         <div id="loading">Loading table data...</div>
         <div class="note">
             Cells display absolute observed gamma magnitude. Sign is retained by color: green is positive, red is negative.
-            The map is current-node first. Replay columns are derived from stored intraday snapshots, not predictions.
+            Expiries controls how many option expirations feed the current map. History Days controls how many stored trading days are used for replay/change context.
         </div>
     </div>
 
@@ -450,9 +455,7 @@
         let activeRequestId = 0;
 
         function getTicker() {
-            const ticker = tickerInput.value.trim().toUpperCase() || 'SPY';
-            tickerInput.value = ticker;
-            return ticker;
+            return tickerInput.value || 'SPY';
         }
 
         function getDays() {
@@ -727,11 +730,7 @@
         }
 
         function getPanelTickers() {
-            return (confluenceTickersInput.value.trim() || '^SPX,SPY,QQQ')
-                .split(',')
-                .map(ticker => ticker.trim().toUpperCase())
-                .filter(Boolean)
-                .slice(0, 3);
+            return [getTicker()];
         }
 
         function getLatestColumn(payload) {
@@ -849,7 +848,7 @@
             document.getElementById('confluenceList').style.display = 'none';
             setLoading(false);
             setLastUpdated();
-            setStatus(`Trinity ${getMode().toUpperCase()} · ${tickers.join(' / ')} · 0DTE-first`);
+            setStatus(`${tickers[0]} ${getMode().toUpperCase()} current map · 0DTE-first`);
         }
 
         async function renderConfluence(date, requestId) {
