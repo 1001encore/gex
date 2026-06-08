@@ -368,6 +368,7 @@ async function makeCS(ticker, interval, mkt_hours) {
 var APP_TIMEZONE = "America/New_York";
 var DAYS_OF_DATA_TO_KEEP = 20;
 var TICKER = "SPY";
+var SCHEDULED_TICKERS = ["SPY", "QQQ", "^SPX"];
 function normalizeTicker(input) {
   const ticker = (input || TICKER).trim().toUpperCase();
   if (!/^[A-Z0-9.^-]{1,12}$/.test(ticker)) {
@@ -688,15 +689,22 @@ var HeatmapBuilderDO = class {
       });
     }
     if (request.method === "POST" && url.pathname === "/api/v1/deleteOldData") {
+      const ticker = normalizeTicker(url.searchParams.get("ticker"));
+      const mode = normalizeMode(url.searchParams.get("mode"));
       const listMap = await this.state.storage.list({
-        prefix: `data_${TICKER}_`
+        prefix: storagePrefix(ticker, mode)
       });
+      if (mode === "gex") {
+        const legacyMap = await this.state.storage.list({
+          prefix: legacyStoragePrefix(ticker)
+        });
+        for (const [key, value] of legacyMap) listMap.set(key, value);
+      }
       const keysToDelete = [];
       const now = /* @__PURE__ */ new Date();
       const cutoffTime = now.getTime() - DAYS_OF_DATA_TO_KEEP * 24 * 60 * 60 * 1e3;
       for (const key of listMap.keys()) {
-        const parts = key.split("_");
-        const dateStr = parts[2];
+        const dateStr = getDateFromStorageKey(key, ticker, mode);
         if (!dateStr) continue;
         const keyDate = new Date(dateStr);
         if (isNaN(keyDate.getTime()) || keyDate.getTime() < cutoffTime) {
@@ -850,48 +858,58 @@ var index_default = {
   async scheduled(controller, env, ctx) {
     const now = new Date((/* @__PURE__ */ new Date()).toLocaleString("en-US", { timeZone: APP_TIMEZONE }));
     if (now.getHours() === 0 && now.getMinutes() < 15) {
-      const cleanupDoId = env.GEX_HISTORY_DO.idFromName(TICKER);
-      const cleanupStub = env.GEX_HISTORY_DO.get(cleanupDoId);
-      ctx.waitUntil(cleanupStub.fetch("https://dummy/api/v1/deleteOldData", { method: "POST" }));
+      for (const ticker of SCHEDULED_TICKERS) {
+        const cleanupDoId = env.GEX_HISTORY_DO.idFromName(ticker);
+        const cleanupStub = env.GEX_HISTORY_DO.get(cleanupDoId);
+        for (const mode of ["gex", "vex"]) {
+          ctx.waitUntil(cleanupStub.fetch(`https://dummy/api/v1/deleteOldData?ticker=${encodeURIComponent(ticker)}&mode=${mode}`, { method: "POST" }));
+        }
+      }
     }
     const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
     if (mkt_hours !== "mkt_open") return;
     const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
     const current_bucket_mins = Math.floor(mins_passed);
     const target_mte = 390 - current_bucket_mins;
-    for (const mode of ["gex", "vex"]) {
-      const { df, spot } = await calc_exposure(TICKER, mte_list, { mode, expirations: 3 });
-      const { limit_up, limit_down } = getChartLimits(df, mte_len);
-      const splitIndex = df.columns.indexOf(target_mte);
-      if (splitIndex === -1) {
-        console.log(`Target MTE ${target_mte} not found in ${mode} grid.`);
-        continue;
+    for (const ticker of SCHEDULED_TICKERS) {
+      for (const mode of ["gex", "vex"]) {
+        try {
+          const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations: 3 });
+          const { limit_up, limit_down } = getChartLimits(df, mte_len);
+          const splitIndex = df.columns.indexOf(target_mte);
+          if (splitIndex === -1) {
+            console.log(`Target MTE ${target_mte} not found in ${ticker} ${mode} grid.`);
+            continue;
+          }
+          const historical_z_strip = df.values.map((row) => row[splitIndex]);
+          const future_columns = df.columns.slice(splitIndex + 1);
+          const future_z_values = df.values.map((row) => row.slice(splitIndex + 1));
+          const stripData = {
+            ticker,
+            mode,
+            historicalStrip: {
+              x_mte: target_mte,
+              z_strip: historical_z_strip
+            },
+            futureMap: {
+              x_mte: future_columns,
+              y_strikes: df.index,
+              z_values: future_z_values
+            },
+            limits: { up: limit_up, down: limit_down },
+            spot
+          };
+          const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+          const stub = env.GEX_HISTORY_DO.get(doId);
+          ctx.waitUntil(stub.fetch("https://dummy/api/v1/addStrip", {
+            method: "POST",
+            body: JSON.stringify(stripData),
+            headers: { "Content-Type": "application/json" }
+          }));
+        } catch (error) {
+          console.error(`Failed scheduled ${mode} collection for ${ticker}:`, error);
+        }
       }
-      const historical_z_strip = df.values.map((row) => row[splitIndex]);
-      const future_columns = df.columns.slice(splitIndex + 1);
-      const future_z_values = df.values.map((row) => row.slice(splitIndex + 1));
-      const stripData = {
-        ticker: TICKER,
-        mode,
-        historicalStrip: {
-          x_mte: target_mte,
-          z_strip: historical_z_strip
-        },
-        futureMap: {
-          x_mte: future_columns,
-          y_strikes: df.index,
-          z_values: future_z_values
-        },
-        limits: { up: limit_up, down: limit_down },
-        spot
-      };
-      const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
-      const stub = env.GEX_HISTORY_DO.get(doId);
-      ctx.waitUntil(stub.fetch("https://dummy/api/v1/addStrip", {
-        method: "POST",
-        body: JSON.stringify(stripData),
-        headers: { "Content-Type": "application/json" }
-      }));
     }
   }
 };
