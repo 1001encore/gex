@@ -141,6 +141,104 @@
             color: var(--muted);
             font-size: 0.86rem;
         }
+        .trinity-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(260px, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        .trinity-panel {
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 16px;
+            background: rgba(13, 17, 16, 0.92);
+            box-shadow: 0 20px 70px rgba(0, 0, 0, 0.24);
+        }
+        .panel-head {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 10px;
+            align-items: center;
+            padding: 10px 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(20, 23, 24, 0.96);
+        }
+        .panel-ticker {
+            padding: 6px 9px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 8px;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+        .panel-spot {
+            color: var(--text);
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        .panel-score {
+            padding: 4px 7px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--muted);
+            font-size: 0.78rem;
+        }
+        .king-bar {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 8px 12px;
+            background: rgba(255, 255, 255, 0.04);
+            color: var(--muted);
+        }
+        .strike-map {
+            display: grid;
+            grid-template-columns: 68px 1fr;
+        }
+        .strike-label, .strike-cell {
+            min-height: 26px;
+            padding: 4px 8px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.035);
+            font-variant-numeric: tabular-nums;
+        }
+        .strike-label {
+            position: relative;
+            color: #cdd6d1;
+            background: rgba(7, 9, 9, 0.8);
+        }
+        .strike-label.spot-row::after {
+            content: "";
+            position: absolute;
+            right: -13px;
+            top: 50%;
+            width: 0;
+            height: 0;
+            transform: translateY(-50%);
+            border-top: 13px solid transparent;
+            border-bottom: 13px solid transparent;
+            border-left: 13px solid #ffffff;
+            z-index: 2;
+        }
+        .strike-label.spot-row {
+            color: #050505;
+            background: #fff;
+            font-weight: 800;
+            border-radius: 7px 0 0 7px;
+        }
+        .strike-cell {
+            text-align: right;
+            color: #f2fbf7;
+        }
+        .strike-cell.king-cell {
+            outline: 2px solid rgba(214, 129, 255, 0.95);
+            outline-offset: -2px;
+            font-weight: 800;
+        }
+        .regime-warning {
+            padding: 8px 12px;
+            color: var(--muted);
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            font-size: 0.8rem;
+        }
         .node-pill strong {
             color: var(--text);
             font-weight: 600;
@@ -256,6 +354,9 @@
             .node-dashboard {
                 grid-template-columns: 1fr;
             }
+            .trinity-grid {
+                grid-template-columns: 1fr;
+            }
             #tableWrap {
                 max-height: 70vh;
             }
@@ -288,7 +389,7 @@
 
             <div class="control-group">
                 <label for="expirations">Expirations</label>
-                <input id="expirations" type="number" min="1" max="12" value="3">
+                <input id="expirations" type="number" min="1" max="12" value="1">
             </div>
 
             <div class="control-group">
@@ -309,8 +410,8 @@
             </div>
 
             <div class="control-group">
-                <label for="confluenceTickers">Confluence</label>
-                <input id="confluenceTickers" type="text" value="SPY,QQQ,^SPX">
+                <label for="confluenceTickers">Panels</label>
+                <input id="confluenceTickers" type="text" value="^SPX,SPY,QQQ">
             </div>
         </div>
         <div class="status-bar">
@@ -318,6 +419,7 @@
             <span id="lastUpdated">Last updated: never</span>
         </div>
         <div id="error"></div>
+        <div id="trinityGrid" class="trinity-grid"></div>
         <div id="nodeDashboard" class="node-dashboard"></div>
         <div id="nodeList" class="node-list"></div>
         <div id="confluenceList" class="node-list"></div>
@@ -337,6 +439,7 @@
         const daysInput = document.getElementById('days');
         const columnStepSelect = document.getElementById('columnStep');
         const confluenceTickersInput = document.getElementById('confluenceTickers');
+        const trinityGrid = document.getElementById('trinityGrid');
         const tableWrap = document.getElementById('tableWrap');
         const loadingDiv = document.getElementById('loading');
 
@@ -623,6 +726,132 @@
             list.innerHTML = pills.join('');
         }
 
+        function getPanelTickers() {
+            return (confluenceTickersInput.value.trim() || '^SPX,SPY,QQQ')
+                .split(',')
+                .map(ticker => ticker.trim().toUpperCase())
+                .filter(Boolean)
+                .slice(0, 3);
+        }
+
+        function getLatestColumn(payload) {
+            const latestIndex = getLatestNodeIndex(payload);
+            return {
+                index: latestIndex,
+                mte: payload.heatmapTrace.x[latestIndex],
+            };
+        }
+
+        function computeGammaRelevance(payload, analytics) {
+            const totalAbs = analytics.nodes.reduce((sum, node) => sum + node.abs, 0);
+            const kingAbs = analytics.king?.abs || 0;
+            const concentration = totalAbs ? kingAbs / totalAbs : 0;
+            const topFiveAbs = analytics.nodes.slice(0, 5).reduce((sum, node) => sum + node.abs, 0);
+            const structure = totalAbs ? topFiveAbs / totalAbs : 0;
+            const nearestMajor = analytics.majorNodes
+                .map(node => Math.abs(node.strike - analytics.spot))
+                .sort((a, b) => a - b)[0];
+            const proximity = Number.isFinite(nearestMajor) && analytics.spot
+                ? Math.max(0, 1 - (nearestMajor / analytics.spot) * 120)
+                : 0;
+            const score = Math.round(concentration * 45 + structure * 30 + proximity * 25);
+            const warnings = [];
+
+            if (score < 35) warnings.push('weak structure');
+            if (concentration < 0.12) warnings.push('no dominant node');
+            if (proximity < 0.25) warnings.push('spot far from major nodes');
+            if ((payload.heatmapTrace.y || []).length < 10) warnings.push('thin chain');
+
+            return {
+                score: Math.max(0, Math.min(100, score)),
+                warnings,
+            };
+        }
+
+        function renderTrinityPanel(ticker, payload) {
+            const analytics = computeNodeAnalytics(payload);
+            const relevance = computeGammaRelevance(payload, analytics);
+            const latest = getLatestColumn(payload);
+            const rows = payload.heatmapTrace.y.map((strike, rowIndex) => {
+                const value = (payload.heatmapTrace.z[rowIndex] || [])[latest.index] || 0;
+                return {
+                    strike,
+                    value,
+                    abs: Math.abs(value),
+                    rowIndex,
+                };
+            });
+            const maxAbs = rows.reduce((max, row) => Math.max(max, row.abs), 0);
+            const spot = Number(payload.spot || 0);
+            const closestSpotStrike = rows
+                .map(row => row.strike)
+                .sort((a, b) => Math.abs(a - spot) - Math.abs(b - spot))[0];
+            const kingStrike = analytics.king?.strike;
+
+            const visibleRows = rows
+                .filter(row => !spot || Math.abs(row.strike - spot) / spot < 0.08 || row.strike === kingStrike)
+                .slice(0, 70);
+
+            let map = '';
+            for (const row of visibleRows) {
+                const isSpot = row.strike === closestSpotStrike;
+                const isKing = row.strike === kingStrike;
+                map += `<div class="strike-label ${isSpot ? 'spot-row' : ''}">${row.strike}</div>`;
+                map += `<div class="strike-cell ${isKing ? 'king-cell' : ''}" style="${getCellStyle(row.value, maxAbs)}">${formatSigned(row.value)}${isKing ? ' *' : ''}</div>`;
+            }
+
+            return `
+                <section class="trinity-panel">
+                    <div class="panel-head">
+                        <div class="panel-ticker">${ticker}</div>
+                        <div class="panel-spot">$${Number(payload.spot || 0).toFixed(2)} - ${payload.mode?.toUpperCase() || getMode().toUpperCase()} - ${latest.mte}m</div>
+                        <div class="panel-score">Relevance ${relevance.score}</div>
+                    </div>
+                    <div class="king-bar">
+                        <span>King ${kingStrike ?? '-'}</span>
+                        <span>${analytics.king ? formatSigned(analytics.king.value) : '-'}</span>
+                    </div>
+                    <div class="strike-map">${map}</div>
+                    <div class="regime-warning">${relevance.warnings.length ? relevance.warnings.join(' - ') : 'structure acceptable; still require price confirmation'}</div>
+                </section>
+            `;
+        }
+
+        async function fetchPanelPayload(ticker, date) {
+            const mode = getMode();
+            const expirations = getExpirations();
+            if (date && date !== 'LIVE') {
+                try {
+                    return await fetchJson(`${WORKER_URL}/api/get-gamma-api?ticker=${encodeURIComponent(ticker)}&mode=${mode}&date=${encodeURIComponent(date)}&days=1&includeFuture=false`);
+                } catch (_) {
+                    // Fall back to live below when a panel has no stored history yet.
+                }
+            }
+            return fetchJson(`${WORKER_URL}/api/live-exposure?ticker=${encodeURIComponent(ticker)}&mode=${mode}&expirations=${expirations}&currentOnly=true`);
+        }
+
+        async function fetchTrinity(requestId = activeRequestId) {
+            const date = dateSelect.value;
+            const tickers = getPanelTickers();
+            const panels = await Promise.all(tickers.map(async (ticker) => {
+                try {
+                    const payload = await fetchPanelPayload(ticker, date);
+                    return renderTrinityPanel(ticker, payload);
+                } catch (error) {
+                    return `<section class="trinity-panel"><div class="panel-head"><div class="panel-ticker">${ticker}</div><div class="panel-spot">Unavailable</div><div class="panel-score">-</div></div><div class="regime-warning">${error.message}</div></section>`;
+                }
+            }));
+            if (requestId !== activeRequestId) return;
+            trinityGrid.innerHTML = panels.join('');
+            tableWrap.style.display = 'none';
+            document.getElementById('nodeDashboard').style.display = 'none';
+            document.getElementById('nodeList').style.display = 'none';
+            document.getElementById('confluenceList').style.display = 'none';
+            setLoading(false);
+            setLastUpdated();
+            setStatus(`Trinity ${getMode().toUpperCase()} · ${tickers.join(' / ')} · 0DTE-first`);
+        }
+
         async function renderConfluence(date, requestId) {
             const mode = getMode();
             const days = getDays();
@@ -763,6 +992,7 @@
         function setLoading(isLoading) {
             loadingDiv.style.display = isLoading ? 'block' : 'none';
             tableWrap.style.display = isLoading ? 'none' : 'block';
+            trinityGrid.style.display = isLoading ? 'none' : 'grid';
         }
 
         function startApp() {
@@ -774,8 +1004,8 @@
 
             if (gammaTimer) clearInterval(gammaTimer);
 
-            fetchGamma(requestId);
-            gammaTimer = setInterval(() => fetchGamma(requestId), 60 * 1000);
+            fetchTrinity(requestId);
+            gammaTimer = setInterval(() => fetchTrinity(requestId), 60 * 1000);
         }
 
         tickerInput.addEventListener('change', fetchAvailableDates);
@@ -783,8 +1013,8 @@
         dateSelect.addEventListener('change', startApp);
         expirationsInput.addEventListener('change', startApp);
         daysInput.addEventListener('change', startApp);
-        columnStepSelect.addEventListener('change', renderGammaTable);
-        confluenceTickersInput.addEventListener('change', () => renderConfluence(dateSelect.value, activeRequestId));
+        columnStepSelect.addEventListener('change', () => fetchTrinity(activeRequestId));
+        confluenceTickersInput.addEventListener('change', startApp);
 
         document.addEventListener('DOMContentLoaded', fetchAvailableDates);
     </script>

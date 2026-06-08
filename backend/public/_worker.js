@@ -888,7 +888,7 @@ var index_default = {
     for (const ticker of SCHEDULED_TICKERS) {
       for (const mode of ["gex", "vex"]) {
         try {
-          const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations: 3 });
+          const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations: 1 });
           const { limit_up, limit_down } = getChartLimits(df, mte_len);
           const splitIndex = df.columns.indexOf(target_mte);
           if (splitIndex === -1) {
