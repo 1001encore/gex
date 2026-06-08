@@ -168,7 +168,7 @@
         th, td {
             border-right: 1px solid rgba(255, 255, 255, 0.06);
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-            padding: 7px 9px;
+            padding: 5px 7px;
             white-space: nowrap;
             text-align: right;
         }
@@ -192,16 +192,14 @@
         }
         .strike-col {
             left: 0;
-            min-width: 88px;
+            min-width: 74px;
             text-align: left;
         }
-        .summary-col.open { left: 88px; }
-        .summary-col.latest { left: 176px; }
-        .summary-col.delta { left: 264px; }
-        .summary-col.delta-pct { left: 352px; }
-        .summary-col.max-abs { left: 440px; }
+        .summary-col.latest { left: 74px; }
+        .summary-col.delta { left: 148px; }
+        .summary-col.max-abs { left: 222px; }
         .summary-col {
-            min-width: 88px;
+            min-width: 74px;
         }
         thead .strike-col, thead .summary-col {
             z-index: 8;
@@ -213,7 +211,7 @@
             color: var(--text);
         }
         .mte-header {
-            min-width: 72px;
+            min-width: 52px;
         }
         .day-start {
             border-left: 2px solid rgba(255, 255, 255, 0.24);
@@ -327,7 +325,7 @@
         <div id="loading">Loading table data...</div>
         <div class="note">
             Cells display absolute observed gamma magnitude. Sign is retained by color: green is positive, red is negative.
-            Replay columns are derived from stored intraday snapshots, not predictions. Visible MTE columns are sampled by the selected step.
+            The map is current-node first. Replay columns are derived from stored intraday snapshots, not predictions.
         </div>
     </div>
 
@@ -703,11 +701,9 @@
 
             let html = '<table><thead><tr>';
             html += '<th class="strike-col" rowspan="2">Strike</th>';
-            html += '<th class="summary-col open" rowspan="2">First</th>';
             html += '<th class="summary-col latest" rowspan="2">Current</th>';
             html += '<th class="summary-col delta" rowspan="2">Change</th>';
-            html += '<th class="summary-col delta-pct" rowspan="2">Change %</th>';
-            html += '<th class="summary-col max-abs" rowspan="2">Session Max</th>';
+            html += '<th class="summary-col max-abs" rowspan="2">Max</th>';
             for (const group of dayGroups) {
                 html += `<th class="day-header" colspan="${group.count}">${group.date}</th>`;
             }
@@ -722,10 +718,8 @@
                 const summary = summarizeRow(row);
                 html += `<tr class="${analytics.rowTags.get(rowIndex) || ''}">`;
                 html += `<th class="strike-col">${y[rowIndex]}</th>`;
-                html += `<td class="summary-col open">${formatSigned(summary.first)}</td>`;
                 html += `<td class="summary-col latest">${formatSigned(summary.latest)}</td>`;
                 html += `<td class="summary-col delta ${summary.delta >= 0 ? 'delta-up' : 'delta-down'}">${formatSigned(summary.delta)}</td>`;
-                html += `<td class="summary-col delta-pct ${summary.delta >= 0 ? 'delta-up' : 'delta-down'}">${summary.deltaPct === null ? '-' : `${summary.deltaPct.toFixed(1)}%`}</td>`;
                 html += `<td class="summary-col max-abs">${formatAbs(summary.maxAbs)}</td>`;
 
                 for (const column of visibleColumns) {

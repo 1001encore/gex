@@ -131,13 +131,11 @@ function legacyStoragePrefix(ticker: string): string {
 
 function getDateFromStorageKey(key: string, ticker: string, mode: ExposureMode): string | null {
   if (key.startsWith(storagePrefix(ticker, mode))) return key.split('_')[3] || null;
-  if (mode === 'gex' && key.startsWith(legacyStoragePrefix(ticker))) return key.split('_')[2] || null;
   return null;
 }
 
 function keyMatchesDate(key: string, ticker: string, mode: ExposureMode, date: string): boolean {
-  return key.startsWith(`${storagePrefix(ticker, mode)}${date}_`)
-    || (mode === 'gex' && key.startsWith(`${legacyStoragePrefix(ticker)}${date}_`));
+  return key.startsWith(`${storagePrefix(ticker, mode)}${date}_`);
 }
 
 export function validateChartPayload(payload: ChartPayload) {
@@ -336,12 +334,6 @@ export class HeatmapBuilderDO implements DurableObject {
       const listMap = await this.state.storage.list<SessionData>({
         prefix: storagePrefix(ticker, mode),
       });
-      if (mode === 'gex') {
-        const legacyMap = await this.state.storage.list<SessionData>({
-          prefix: legacyStoragePrefix(ticker),
-        });
-        for (const [key, value] of legacyMap) listMap.set(key, value);
-      }
 
       if (listMap.size === 0) {
         return new Response(JSON.stringify({ error: 'No data available' }), { status: 404 });
@@ -473,10 +465,6 @@ export class HeatmapBuilderDO implements DurableObject {
       const ticker = normalizeTicker(url.searchParams.get('ticker'));
       const mode = normalizeMode(url.searchParams.get('mode'));
       const listMap = await this.state.storage.list({ prefix: storagePrefix(ticker, mode) });
-      if (mode === 'gex') {
-        const legacyMap = await this.state.storage.list({ prefix: legacyStoragePrefix(ticker) });
-        for (const [key, value] of legacyMap) listMap.set(key, value);
-      }
       const allKeys = Array.from(listMap.keys());
       // Extract "2023-10-25" from "data_SPY_2023-10-25_mkt_open"
       const uniqueDates = [...new Set(allKeys.map(k => getDateFromStorageKey(k, ticker, mode)).filter(Boolean) as string[])].sort();
@@ -493,12 +481,6 @@ export class HeatmapBuilderDO implements DurableObject {
       const listMap = await this.state.storage.list<SessionData>({
         prefix: storagePrefix(ticker, mode),
       });
-      if (mode === 'gex') {
-        const legacyMap = await this.state.storage.list<SessionData>({
-          prefix: legacyStoragePrefix(ticker),
-        });
-        for (const [key, value] of legacyMap) listMap.set(key, value);
-      }
 
       const keysToDelete: string[] = [];
       const now = new Date();
@@ -518,6 +500,18 @@ export class HeatmapBuilderDO implements DurableObject {
         return new Response(`Deleted: ${keysToDelete.join(', ')}`);
       }
       return new Response('No old data to delete.');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/v1/deleteLegacyData') {
+      const ticker = normalizeTicker(url.searchParams.get('ticker'));
+      const listMap = await this.state.storage.list({ prefix: legacyStoragePrefix(ticker) });
+      const keysToDelete = Array.from(listMap.keys());
+      if (keysToDelete.length > 0) {
+        await this.state.storage.delete(keysToDelete);
+      }
+      return new Response(JSON.stringify({ ticker, deleted: keysToDelete.length, keys: keysToDelete }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
     return new Response('Not found', { status: 404 });
@@ -662,6 +656,24 @@ export default {
         };
 
         return addCORSHeaders(new Response(JSON.stringify(payload), {
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+
+      if (url.pathname === '/admin/delete-legacy') {
+        if (!isAuthorizedCron(request, env)) {
+          return addCORSHeaders(new Response('Unauthorized', { status: 401 }));
+        }
+        const tickers = (url.searchParams.get('tickers') || SCHEDULED_TICKERS.join(','))
+          .split(',')
+          .map((ticker) => normalizeTicker(ticker));
+        const results = await Promise.all(tickers.map(async (ticker) => {
+          const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+          const stub = env.GEX_HISTORY_DO.get(doId);
+          const response = await stub.fetch(`https://dummy/api/v1/deleteLegacyData?ticker=${encodeURIComponent(ticker)}`, { method: 'POST' });
+          return response.json();
+        }));
+        return addCORSHeaders(new Response(JSON.stringify({ deleted: results }), {
           headers: { 'Content-Type': 'application/json' },
         }));
       }
