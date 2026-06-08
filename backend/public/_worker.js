@@ -806,23 +806,28 @@ var index_default = {
         const ticker = normalizeTicker(url.searchParams.get("ticker"));
         const mode = normalizeMode(url.searchParams.get("mode"));
         const expirations = normalizeExpirations(url.searchParams.get("expirations"));
+        const currentOnly = url.searchParams.get("currentOnly") === "true";
         const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
         const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
         const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations });
         const { limit_up, limit_down } = getChartLimits(df, mte_len);
+        const currentMte = mkt_hours === "mkt_open" ? 390 - Math.floor(mins_passed) : df.columns[0];
+        const currentIndex = Math.max(0, df.columns.indexOf(currentMte));
+        const liveColumns = currentOnly ? [df.columns[currentIndex]] : df.columns;
+        const liveValues = currentOnly ? df.values.map((row) => [row[currentIndex] || 0]) : df.values;
         const payload = {
           date: getDateStr(0, APP_TIMEZONE),
           dates: [getDateStr(0, APP_TIMEZONE)],
           mode,
           heatmapTrace: {
-            x: df.columns,
+            x: liveColumns,
             y: df.index,
-            z: df.values
+            z: liveValues
           },
           limits: { up: limit_up, down: limit_down },
           spot,
           sessionMarkers: [],
-          daySegments: [{ date: getDateStr(0, APP_TIMEZONE), start: 0, end: df.columns.length - 1 }]
+          daySegments: [{ date: getDateStr(0, APP_TIMEZONE), start: 0, end: liveColumns.length - 1 }]
         };
         return addCORSHeaders(new Response(JSON.stringify(payload), {
           headers: { "Content-Type": "application/json" }

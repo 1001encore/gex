@@ -295,7 +295,7 @@
 
             <div class="control-group">
                 <label for="days">Days</label>
-                <input id="days" type="number" min="1" max="10" value="3">
+                <input id="days" type="number" min="1" max="10" value="1">
             </div>
 
             <div class="control-group">
@@ -303,9 +303,10 @@
                 <select id="columnStep">
                     <option value="1">1m</option>
                     <option value="2">2m</option>
-                    <option value="5" selected>5m</option>
+                    <option value="5">5m</option>
                     <option value="15">15m</option>
-                    <option value="30">30m</option>
+                    <option value="30" selected>30m</option>
+                    <option value="60">60m</option>
                 </select>
             </div>
 
@@ -326,7 +327,7 @@
         <div id="loading">Loading table data...</div>
         <div class="note">
             Cells display absolute observed gamma magnitude. Sign is retained by color: green is positive, red is negative.
-            Summary columns use the full returned data; visible MTE columns are sampled by the selected step.
+            Replay columns are derived from stored intraday snapshots, not predictions. Visible MTE columns are sampled by the selected step.
         </div>
     </div>
 
@@ -354,7 +355,7 @@
         }
 
         function getDays() {
-            const days = Math.max(1, Math.min(10, Number(daysInput.value || 3)));
+            const days = Math.max(1, Math.min(10, Number(daysInput.value || 1)));
             daysInput.value = String(days);
             return days;
         }
@@ -644,7 +645,7 @@
         }
 
         function getVisibleColumns(payload) {
-            const step = Number(columnStepSelect.value || 5);
+            const step = Number(columnStepSelect.value || 30);
             const x = payload.heatmapTrace.x;
             const segments = payload.daySegments?.length
                 ? payload.daySegments
@@ -702,11 +703,11 @@
 
             let html = '<table><thead><tr>';
             html += '<th class="strike-col" rowspan="2">Strike</th>';
-            html += '<th class="summary-col open" rowspan="2">Open</th>';
-            html += '<th class="summary-col latest" rowspan="2">Latest</th>';
-            html += '<th class="summary-col delta" rowspan="2">Delta</th>';
-            html += '<th class="summary-col delta-pct" rowspan="2">Delta %</th>';
-            html += '<th class="summary-col max-abs" rowspan="2">Max Abs</th>';
+            html += '<th class="summary-col open" rowspan="2">First</th>';
+            html += '<th class="summary-col latest" rowspan="2">Current</th>';
+            html += '<th class="summary-col delta" rowspan="2">Change</th>';
+            html += '<th class="summary-col delta-pct" rowspan="2">Change %</th>';
+            html += '<th class="summary-col max-abs" rowspan="2">Session Max</th>';
             for (const group of dayGroups) {
                 html += `<th class="day-header" colspan="${group.count}">${group.date}</th>`;
             }
@@ -753,7 +754,7 @@
                 const mode = getMode();
                 const expirations = getExpirations();
                 const data = date === 'LIVE'
-                    ? await fetchJson(`${WORKER_URL}/api/live-exposure?ticker=${encodeURIComponent(ticker)}&mode=${mode}&expirations=${expirations}`)
+                    ? await fetchJson(`${WORKER_URL}/api/live-exposure?ticker=${encodeURIComponent(ticker)}&mode=${mode}&expirations=${expirations}&currentOnly=true`)
                     : await fetchJson(`${WORKER_URL}/api/get-gamma-api?ticker=${encodeURIComponent(ticker)}&mode=${mode}&date=${encodeURIComponent(date)}&days=${days}&includeFuture=false`);
                 if (requestId !== activeRequestId) return;
                 latestGammaData = data;
