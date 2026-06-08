@@ -109,20 +109,18 @@ export async function getYahooAuth(): Promise<{ cookie: string; crumb: string }>
  * @param timeZone The app's timezone (e.g., 'America/New_York')
  * @returns { key: string, session: string }
  */
-export function getStorageKey(ticker: string, timeZone: string): { key: string, session: string } {
-  const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
+export function getStorageKey(
+  ticker: string,
+  timeZone: string,
+  now = new Date(),
+  mode = 'gex'
+): { key: string, session: string } {
+  const dateStr = getDateStr(0, timeZone, now);
+  const { mkt_hours } = getMarketStatus(timeZone, now);
 
-  // Get YYYY-MM-DD
-  const year = now.getFullYear();
-  const month = (now.getMonth() + 1).toString().padStart(2, '0');
-  const day = now.getDate().toString().padStart(2, '0');
-  const dateStr = `${year}-${month}-${day}`;
-
-  const { mkt_hours } = getMarketStatus(timeZone);
-
-  // Key format: data_TICKER_YYYY-MM-DD_SESSION
+  // Key format: data_MODE_TICKER_YYYY-MM-DD_SESSION
   return {
-    key: `data_${ticker.toUpperCase()}_${dateStr}_${mkt_hours}`,
+    key: `data_${mode.toLowerCase()}_${ticker.toUpperCase()}_${dateStr}_${mkt_hours}`,
     session: mkt_hours
   };
 }
@@ -133,44 +131,81 @@ export function getStorageKey(ticker: string, timeZone: string): { key: string, 
  * @param timeZone The app's timeZone
  * @returns YYYY-MM-DD string
  */
-export function getDateStr(daysAgo: number, timeZone: string): string {
-  const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
-  now.setDate(now.getDate() - daysAgo);
-
-  const year = now.getFullYear();
-  const month = (now.getMonth() + 1).toString().padStart(2, '0');
-  const day = now.getDate().toString().padStart(2, '0');
+export function getDateStr(daysAgo: number, timeZone: string, now = new Date()): string {
+  const parts = getZonedParts(now, timeZone);
+  const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day - daysAgo));
+  const year = shifted.getUTCFullYear();
+  const month = (shifted.getUTCMonth() + 1).toString().padStart(2, '0');
+  const day = shifted.getUTCDate().toString().padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
 export function getMarketStatus(timeZone: string): {
   mkt_hours: string;
   mins_passed: number;
+};
+export function getMarketStatus(timeZone: string, now: Date): {
+  mkt_hours: string;
+  mins_passed: number;
+};
+export function getMarketStatus(timeZone: string, now = new Date()): {
+  mkt_hours: string;
+  mins_passed: number;
 } {
-  const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
-  const mkt_open = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-    16,
-    30,
-    0
-  );
-  const dayOfWeek = now.getDay();
-  const nowInTZ = new Date(now.toLocaleString('en-US', { timeZone }));
-  const mktOpenInTZ = new Date(mkt_open.toLocaleString('en-US', { timeZone }));
-  const mins_passed = Math.floor(
-    (nowInTZ.getTime() - mktOpenInTZ.getTime()) / 60000
-  );
+  const parts = getZonedParts(now, timeZone);
+  const marketOpenMinute = 9 * 60 + 30;
+  const marketCloseMinute = 16 * 60;
+  const currentMinute = parts.hour * 60 + parts.minute;
+  const mins_passed = currentMinute - marketOpenMinute;
 
   // Options market is only open during regular hours (6.5h = 390 mins)
-  if (dayOfWeek === 0 || dayOfWeek === 6)
+  if (parts.dayOfWeek === 0 || parts.dayOfWeek === 6)
     return { mkt_hours: 'mkt_closed', mins_passed };
 
-  if (mins_passed >= 0 && mins_passed <= 390)
+  if (currentMinute >= marketOpenMinute && currentMinute < marketCloseMinute)
     return { mkt_hours: 'mkt_open', mins_passed };
 
   return { mkt_hours: 'mkt_closed', mins_passed };
+}
+
+function getZonedParts(date: Date, timeZone: string): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  dayOfWeek: number;
+} {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    weekday: 'short',
+  });
+  const values = Object.fromEntries(
+    formatter.formatToParts(date).map((part) => [part.type, part.value])
+  );
+  const dayMap: Record<string, number> = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: Number(values.hour) % 24,
+    minute: Number(values.minute),
+    dayOfWeek: dayMap[values.weekday] ?? 0,
+  };
 }
 
 export function getMteList(mkt_hours: string, mins_passed: number, interval = 1) {
@@ -198,10 +233,30 @@ export interface GammaDf {
   values: number[][];
 }
 
+export type ExposureMode = 'gex' | 'vex';
+
+export interface ExposureOptions {
+  mode?: ExposureMode;
+  expirations?: number;
+  now?: Date;
+}
+
 export async function calc_gamma(
   ticker: string,
-  mte_list: number[]
+  mte_list: number[],
+  options: ExposureOptions = {}
 ): Promise<{ df: GammaDf; spot: number }> {
+  return calc_exposure(ticker, mte_list, { ...options, mode: options.mode || 'gex' });
+}
+
+export async function calc_exposure(
+  ticker: string,
+  mte_list: number[],
+  options: ExposureOptions = {}
+): Promise<{ df: GammaDf; spot: number }> {
+  const mode = options.mode || 'gex';
+  const expirationCount = Math.max(1, Math.min(12, options.expirations || 3));
+  const now = options.now || new Date();
   const { cookie, crumb } = await getYahooAuth();
   const authedHeaders = { ...YF_HEADERS, Cookie: cookie! };
   const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=5m&crumb=${crumb}`;
@@ -223,78 +278,114 @@ export async function calc_gamma(
     throw new Error(`Failed to fetch options dates: ${optionsRes.status}`);
   }
   const optionsJson = (await optionsRes.json()) as any;
-  const exp_date_timestamp =
-    optionsJson?.optionChain?.result?.[0]?.expirationDates?.[0];
-  if (!exp_date_timestamp)
+  const expirationDates: number[] =
+    optionsJson?.optionChain?.result?.[0]?.expirationDates?.slice(0, expirationCount) || [];
+  if (expirationDates.length === 0)
     throw new Error(`Could not get expiration dates for ${ticker}`);
 
-  const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${exp_date_timestamp}&crumb=${crumb}`;
-  const chainRes = await fetch(chainUrl, { headers: authedHeaders });
-  if (!chainRes.ok) {
-    if (chainRes.status === 401 || chainRes.status === 403)
-      yahooAuth.expiry = 0;
-    throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
-  }
-  const chainJson = (await chainRes.json()) as any;
-  const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
-  if (!chain || !chain.calls || !chain.puts) {
-    console.error(
-      'Failed to parse chain. Full API response:',
-      JSON.stringify(chainJson, null, 2)
-    );
-    throw new Error(`Could not fetch options chain for ${ticker}`);
-  }
-  const calls: any[] = chain.calls;
-  const puts: any[] = chain.puts;
-  const spot2 = spot * spot;
-  const gamma_values_c: Record<string, number[]> = {};
-  const gamma_values_p: Record<string, number[]> = {};
+  const exposureByStrike: Record<string, number[]> = {};
   const allStrikes = new Set<number>();
-  calls.forEach((c) => {
-    if (c.strike) allStrikes.add(c.strike);
-    gamma_values_c[c.strike] = [];
-  });
-  puts.forEach((p) => {
-    if (p.strike) allStrikes.add(p.strike);
-    gamma_values_p[p.strike] = [];
-  });
-  for (const K of allStrikes) {
-    for (const T of mte_list) {
-      const call = calls.find((c) => c.strike === K);
-      if (call) {
-        const gex_cc = (call.openInterest || 0) * (call.volume || 0);
-        const gamma_c = gamma_function_call(spot, K, T);
-        const value = Math.round(gamma_c * gex_cc * spot2 * 0.01 * 10) / 10;
-        gamma_values_c[K].push(value);
-      } else {
-        gamma_values_c[K]?.push(0);
-      }
-      const put = puts.find((p) => p.strike === K);
-      if (put) {
-        const gex_pp = (put.openInterest || 0) * (put.volume || 0);
-        const gamma_p = gamma_function_put(spot, K, T);
-        const value = Math.round(gamma_p * gex_pp * spot2 * 0.01 * 10) / 10;
-        gamma_values_p[K].push(value);
-      } else {
-        gamma_values_p[K]?.push(0);
+
+  for (const expiration of expirationDates) {
+    const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${expiration}&crumb=${crumb}`;
+    const chainRes = await fetch(chainUrl, { headers: authedHeaders });
+    if (!chainRes.ok) {
+      if (chainRes.status === 401 || chainRes.status === 403)
+        yahooAuth.expiry = 0;
+      throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
+    }
+    const chainJson = (await chainRes.json()) as any;
+    const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
+    if (!chain || !chain.calls || !chain.puts) {
+      console.error(
+        'Failed to parse chain. Full API response:',
+        JSON.stringify(chainJson, null, 2)
+      );
+      throw new Error(`Could not fetch options chain for ${ticker}`);
+    }
+
+    for (const contract of [...chain.calls, ...chain.puts]) {
+      if (!contract.strike) continue;
+      allStrikes.add(contract.strike);
+      exposureByStrike[contract.strike] ||= mte_list.map(() => 0);
+    }
+
+    const callsByStrike = new Map<number, any>(chain.calls.map((contract: any) => [contract.strike, contract]));
+    const putsByStrike = new Map<number, any>(chain.puts.map((contract: any) => [contract.strike, contract]));
+
+    for (const K of allStrikes) {
+      exposureByStrike[K] ||= mte_list.map(() => 0);
+      const call = callsByStrike.get(K);
+      const put = putsByStrike.get(K);
+
+      for (let i = 0; i < mte_list.length; i++) {
+        const projectedMinutesElapsed = 390 - mte_list[i];
+        const minutesToExpiration = getMinutesToExpiration(expiration, now, projectedMinutesElapsed);
+        const callValue = call ? calcContractExposure(mode, 'call', spot, K, minutesToExpiration, call) : 0;
+        const putValue = put ? calcContractExposure(mode, 'put', spot, K, minutesToExpiration, put) : 0;
+        exposureByStrike[K][i] += callValue + putValue;
       }
     }
   }
+
   const df: GammaDf = {
     index: Array.from(allStrikes).sort((a, b) => b - a),
     columns: mte_list,
     values: [],
   };
   df.index.forEach((strike) => {
-    const call_row = gamma_values_c[strike] || mte_list.map(() => 0);
-    const put_row = gamma_values_p[strike] || mte_list.map(() => 0);
-    const combined_row = call_row.map((call_val, i) => {
-      const put_val = put_row[i] || 0;
-      return (call_val || 0) + (put_val || 0);
-    });
-    df.values.push(combined_row);
+    df.values.push((exposureByStrike[strike] || mte_list.map(() => 0)).map((value) => Math.round(value * 10) / 10));
   });
   return { df, spot };
+}
+
+function getMinutesToExpiration(expirationTimestampSeconds: number, now: Date, projectedMinutesElapsed: number): number {
+  const expirationMs = expirationTimestampSeconds * 1000;
+  const projectedNowMs = now.getTime() + projectedMinutesElapsed * 60_000;
+  return Math.max(1, (expirationMs - projectedNowMs) / 60_000);
+}
+
+function calcContractExposure(
+  mode: ExposureMode,
+  type: 'call' | 'put',
+  S: number,
+  K: number,
+  minutesToExpiration: number,
+  contract: any
+): number {
+  const sigma = Number(contract.impliedVolatility) > 0 ? Number(contract.impliedVolatility) : 0.2;
+  const openInterest = Number(contract.openInterest || 0);
+  const volume = Number(contract.volume || 0);
+  const contractCount = openInterest + volume * 0.25;
+  if (!contractCount) return 0;
+
+  const sign = type === 'call' ? 1 : -1;
+  if (mode === 'vex') {
+    const vanna = blackScholesVanna(S, K, minutesToExpiration, sigma);
+    return sign * vanna * contractCount * S * 0.01;
+  }
+
+  const gamma = blackScholesGamma(S, K, minutesToExpiration, sigma);
+  return sign * gamma * contractCount * S * S * 0.01;
+}
+
+export function blackScholesGamma(S: number, K: number, minutesToExpiration: number, sigma: number, r = 0.05): number {
+  const T = minutesToExpiration / (365 * 24 * 60);
+  if (S <= 0 || K <= 0 || T <= 0 || sigma <= 0) return 0;
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  return normalPdf(d1) / (S * sigma * Math.sqrt(T));
+}
+
+export function blackScholesVanna(S: number, K: number, minutesToExpiration: number, sigma: number, r = 0.05): number {
+  const T = minutesToExpiration / (365 * 24 * 60);
+  if (S <= 0 || K <= 0 || T <= 0 || sigma <= 0) return 0;
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  const d2 = d1 - sigma * Math.sqrt(T);
+  return -normalPdf(d1) * d2 / sigma;
+}
+
+function normalPdf(x: number): number {
+  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
 }
 export function gamma_function_call(S: number, K: number, T: number): number {
   const r = 0.05;

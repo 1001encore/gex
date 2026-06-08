@@ -3,6 +3,7 @@
 
 # Node
 node_modules/
+backend/.tmp/
 
 # OS
 .DS_Store

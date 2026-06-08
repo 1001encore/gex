@@ -9,6 +9,7 @@
   
   "scripts": {
     "build": "esbuild src/index.ts --bundle --outfile=public/_worker.js --format=esm --sourcemap",
+    "test": "esbuild tests/core.test.ts --bundle --platform=node --outfile=.tmp/core.test.mjs --format=esm && node .tmp/core.test.mjs",
     "dev": "npm run build && wrangler pages dev public --do GEX_HISTORY_DO=HeatmapBuilderDO"
   }
 }

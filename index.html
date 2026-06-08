@@ -3,131 +3,422 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gamma Chart</title>
-    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <title>Gamma Table</title>
     <style>
+        :root {
+            --bg: #0d1110;
+            --panel: #171d1b;
+            --panel-2: #202826;
+            --line: #33413d;
+            --text: #edf5f0;
+            --muted: #9aaca5;
+            --pos: 28, 168, 128;
+            --pos-hot: 246, 211, 80;
+            --neg: 77, 112, 255;
+            --neg-hot: 142, 76, 224;
+            --warn: #ffc9c7;
+        }
+        * {
+            box-sizing: border-box;
+        }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background-color: #111;
-            color: #eee;
+            font-family: Georgia, "Times New Roman", serif;
+            background:
+                radial-gradient(circle at 20% 0%, rgba(49, 105, 87, 0.24), transparent 32rem),
+                linear-gradient(135deg, #0d1110 0%, #151311 100%);
+            color: var(--text);
             margin: 0;
             padding: 20px;
         }
         .container {
-            max-width: 1200px;
+            max-width: 1540px;
             margin: 0 auto;
         }
         h1 {
-            text-align: center;
-            color: #eee;
+            margin: 0 0 18px;
+            font-size: clamp(2rem, 5vw, 4.8rem);
+            font-weight: 500;
+            letter-spacing: -0.06em;
         }
         .controls {
             display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 15px;
-            margin-bottom: 20px;
-            background: #222;
-            padding: 15px;
-            border-radius: 8px;
+            flex-wrap: wrap;
+            align-items: end;
+            gap: 12px;
+            margin-bottom: 14px;
+            background: rgba(23, 29, 27, 0.92);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            padding: 14px;
+            border-radius: 14px;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.24);
         }
         .control-group {
             display: flex;
             flex-direction: column;
-            gap: 5px;
+            gap: 6px;
         }
         label {
-            font-size: 0.8em;
-            color: #aaa;
+            font-size: 0.75rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
         }
         input, select {
-            padding: 8px;
-            background-color: #333;
-            color: #eee;
-            border: 1px solid #555;
-            border-radius: 4px;
-            min-width: 100px;
+            padding: 9px 10px;
+            background-color: #101614;
+            color: var(--text);
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            min-width: 110px;
         }
-        #chart {
-            width: 100%;
-            height: 600px;
-            background-color: #222;
-            border-radius: 8px;
+        #days {
+            width: 90px;
+            min-width: 90px;
+        }
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+        #error {
+            display: none;
+            margin-bottom: 12px;
+            padding: 12px 14px;
+            border: 1px solid rgba(var(--neg), 0.45);
+            border-radius: 10px;
+            background: rgba(var(--neg), 0.12);
+            color: var(--warn);
+        }
+        .node-dashboard {
+            display: grid;
+            grid-template-columns: minmax(240px, 1.2fr) repeat(4, minmax(150px, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        .node-card {
+            min-height: 118px;
+            padding: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(32, 40, 38, 0.95), rgba(18, 24, 22, 0.95));
+        }
+        .node-card.major {
+            background:
+                radial-gradient(circle at 80% 0%, rgba(var(--pos-hot), 0.25), transparent 10rem),
+                linear-gradient(180deg, rgba(34, 44, 40, 0.98), rgba(18, 24, 22, 0.98));
+        }
+        .node-label {
+            color: var(--muted);
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+        .node-value {
+            margin-top: 8px;
+            font-size: clamp(1.6rem, 3vw, 2.8rem);
+            line-height: 0.95;
+            letter-spacing: -0.05em;
+        }
+        .node-meta {
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 0.86rem;
+        }
+        .node-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+        .node-pill {
+            padding: 8px 10px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 999px;
+            background: rgba(20, 27, 25, 0.92);
+            color: var(--muted);
+            font-size: 0.86rem;
+        }
+        .node-pill strong {
+            color: var(--text);
+            font-weight: 600;
         }
         #loading {
             text-align: center;
             padding: 50px;
-            font-size: 1.2em;
+            font-size: 1.2rem;
+        }
+        #tableWrap {
+            width: 100%;
+            max-height: 74vh;
+            overflow: auto;
+            background: rgba(17, 23, 21, 0.92);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+        }
+        table {
+            width: max-content;
+            min-width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-variant-numeric: tabular-nums;
+        }
+        th, td {
+            border-right: 1px solid rgba(255, 255, 255, 0.06);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            padding: 7px 9px;
+            white-space: nowrap;
+            text-align: right;
+        }
+        thead th {
+            position: sticky;
+            top: 0;
+            z-index: 5;
+            background: #202826;
+            color: var(--muted);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+        thead tr:nth-child(2) th {
+            top: 31px;
+        }
+        .strike-col, .summary-col {
+            position: sticky;
+            z-index: 6;
+            background: #18201e;
+        }
+        .strike-col {
+            left: 0;
+            min-width: 88px;
+            text-align: left;
+        }
+        .summary-col.open { left: 88px; }
+        .summary-col.latest { left: 176px; }
+        .summary-col.delta { left: 264px; }
+        .summary-col.delta-pct { left: 352px; }
+        .summary-col.max-abs { left: 440px; }
+        .summary-col {
+            min-width: 88px;
+        }
+        thead .strike-col, thead .summary-col {
+            z-index: 8;
+            background: #24302c;
+        }
+        .day-header {
+            text-align: center;
+            background: #26332f;
+            color: var(--text);
+        }
+        .mte-header {
+            min-width: 72px;
+        }
+        .day-start {
+            border-left: 2px solid rgba(255, 255, 255, 0.24);
+        }
+        .cell-pos {
+            color: #ddfff4;
+        }
+        .cell-neg {
+            color: #eee4ff;
+        }
+        .delta-up {
+            color: rgb(var(--pos));
+        }
+        .delta-down {
+            color: rgb(var(--neg-hot));
+        }
+        tr.king-row .strike-col {
+            color: rgb(var(--pos-hot));
+        }
+        tr.floor-row .strike-col, tr.ceiling-row .strike-col {
+            color: #ddfff4;
+        }
+        tr.gatekeeper-row .strike-col {
+            color: #eee4ff;
+        }
+        .empty {
+            color: #51615c;
+        }
+        .note {
+            margin-top: 10px;
+            color: var(--muted);
+            font-size: 0.86rem;
+        }
+        @media (max-width: 720px) {
+            body {
+                padding: 12px;
+            }
+            .controls, .status-bar {
+                align-items: stretch;
+                flex-direction: column;
+            }
+            .node-dashboard {
+                grid-template-columns: 1fr;
+            }
+            #tableWrap {
+                max-height: 70vh;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Intraday Gamma Exposure</h1>
+        <h1>Intraday Gamma Table</h1>
         <div class="controls">
             <div class="control-group">
                 <label for="ticker">Ticker</label>
                 <input id="ticker" type="text" value="SPY">
             </div>
-            
+
             <div class="control-group">
-                <label for="dateSelect">Date</label>
+                <label for="dateSelect">End Date</label>
                 <select id="dateSelect">
                     <option value="" disabled selected>Loading...</option>
                 </select>
             </div>
 
             <div class="control-group">
-                <label for="interval">OHLC Interval</label>
-                <select id="interval">
-                    <option value="1m">1m</option>
-                    <option value="2m">2m</option>
-                    <option value="5m" selected>5m</option>
-                    <option value="15m">15m</option>
-                    <option value="30m">30m</option>
+                <label for="mode">Mode</label>
+                <select id="mode">
+                    <option value="gex" selected>GEX</option>
+                    <option value="vex">VEX</option>
                 </select>
             </div>
+
+            <div class="control-group">
+                <label for="expirations">Expirations</label>
+                <input id="expirations" type="number" min="1" max="12" value="3">
+            </div>
+
+            <div class="control-group">
+                <label for="days">Days</label>
+                <input id="days" type="number" min="1" max="10" value="3">
+            </div>
+
+            <div class="control-group">
+                <label for="columnStep">MTE Step</label>
+                <select id="columnStep">
+                    <option value="1">1m</option>
+                    <option value="2">2m</option>
+                    <option value="5" selected>5m</option>
+                    <option value="15">15m</option>
+                    <option value="30">30m</option>
+                </select>
+            </div>
+
+            <div class="control-group">
+                <label for="confluenceTickers">Confluence</label>
+                <input id="confluenceTickers" type="text" value="SPY,QQQ,^SPX">
+            </div>
         </div>
-        <div id="chart"></div>
-        <div id="loading">Loading chart data...</div>
+        <div class="status-bar">
+            <span id="status">Initializing...</span>
+            <span id="lastUpdated">Last updated: never</span>
+        </div>
+        <div id="error"></div>
+        <div id="nodeDashboard" class="node-dashboard"></div>
+        <div id="nodeList" class="node-list"></div>
+        <div id="confluenceList" class="node-list"></div>
+        <div id="tableWrap"></div>
+        <div id="loading">Loading table data...</div>
+        <div class="note">
+            Cells display absolute observed gamma magnitude. Sign is retained by color: green is positive, red is negative.
+            Summary columns use the full returned data; visible MTE columns are sampled by the selected step.
+        </div>
     </div>
 
     <script>
         const tickerInput = document.getElementById('ticker');
-        const intervalSelect = document.getElementById('interval');
         const dateSelect = document.getElementById('dateSelect');
-        const chartDiv = document.getElementById('chart');
+        const modeSelect = document.getElementById('mode');
+        const expirationsInput = document.getElementById('expirations');
+        const daysInput = document.getElementById('days');
+        const columnStepSelect = document.getElementById('columnStep');
+        const confluenceTickersInput = document.getElementById('confluenceTickers');
+        const tableWrap = document.getElementById('tableWrap');
         const loadingDiv = document.getElementById('loading');
-        
-        // --- CONFIG ---
+
         const WORKER_URL = "https://gex.1001encore.workers.dev";
 
-        // --- State ---
         let latestGammaData = null;
-        let latestOhlcData = null;
         let gammaTimer = null;
-        let ohlcTimer = null;
+        let activeRequestId = 0;
 
-        // --- 1. Fetch Available Dates ---
+        function getTicker() {
+            const ticker = tickerInput.value.trim().toUpperCase() || 'SPY';
+            tickerInput.value = ticker;
+            return ticker;
+        }
+
+        function getDays() {
+            const days = Math.max(1, Math.min(10, Number(daysInput.value || 3)));
+            daysInput.value = String(days);
+            return days;
+        }
+
+        function getExpirations() {
+            const expirations = Math.max(1, Math.min(12, Number(expirationsInput.value || 3)));
+            expirationsInput.value = String(expirations);
+            return expirations;
+        }
+
+        function getMode() {
+            return modeSelect.value;
+        }
+
+        function setStatus(message) {
+            document.getElementById('status').textContent = message;
+        }
+
+        function setLastUpdated() {
+            document.getElementById('lastUpdated').textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = message ? 'block' : 'none';
+        }
+
+        async function fetchJson(url) {
+            const res = await fetch(url);
+            if (!res.ok) {
+                let detail = `${res.status} ${res.statusText}`;
+                try {
+                    const body = await res.json();
+                    if (body.error) detail = body.error;
+                } catch (_) {}
+                throw new Error(detail);
+            }
+            return res.json();
+        }
+
         async function fetchAvailableDates() {
             try {
-                const ticker = tickerInput.value;
-                const res = await fetch(`${WORKER_URL}/api/get-dates?ticker=${ticker}`);
-                if (!res.ok) throw new Error("Failed to fetch dates");
-                
-                const dates = await res.json();
-                
-                // Clear existing options
+                const requestId = ++activeRequestId;
+                const ticker = getTicker();
+                const mode = getMode();
+                showError('');
+                setStatus(`Loading ${mode.toUpperCase()} dates for ${ticker}...`);
+                const dates = await fetchJson(`${WORKER_URL}/api/get-dates?ticker=${encodeURIComponent(ticker)}&mode=${mode}`);
+                if (requestId !== activeRequestId) return;
+
                 dateSelect.innerHTML = '';
-                
+
                 if (dates.length === 0) {
                     const option = document.createElement('option');
-                    option.text = "No Data Yet";
+                    option.value = "LIVE";
+                    option.text = "Live Snapshot";
                     dateSelect.add(option);
+                    dateSelect.value = "LIVE";
+                    setStatus(`No stored ${mode.toUpperCase()} history for ${ticker}; using live snapshot`);
+                    startApp();
                     return;
                 }
 
-                // Populate Dropdown
                 dates.forEach(date => {
                     const option = document.createElement('option');
                     option.value = date;
@@ -135,124 +426,372 @@
                     dateSelect.add(option);
                 });
 
-                // Select the LATEST date by default (last in array)
                 dateSelect.value = dates[dates.length - 1];
-
-                // Trigger initial data load
-                startApp(); 
-
+                startApp();
             } catch (err) {
                 console.error("Error fetching dates:", err);
                 dateSelect.innerHTML = '<option>Error</option>';
+                showError(`Could not load available dates: ${err.message}`);
+                setStatus('Date load failed');
             }
         }
 
-        // --- 2. Plotting Logic ---
-        function plotCombinedChart() {
-            if (!latestGammaData || !latestOhlcData) return;
-            setLoading(false);
-
-            const sessionShapes = latestGammaData.sessionMarkers.map(marker => ({
-                type: 'line',
-                xref: 'x', yref: 'paper',
-                x0: marker.x, y0: 0, x1: marker.x, y1: 1,
-                line: { color: 'rgba(200, 200, 200, 0.5)', width: 1, dash: 'dot' }
-            }));
-
-            // Use the DATE from the backend to set the title
-            const chartTitle = `${tickerInput.value.toUpperCase()} Gamma - ${latestGammaData.date} (Spot: ${latestGammaData.spot})`;
-
-            const layout = {
-                title: chartTitle,
-                xaxis: {
-                    title: "mte",
-                    range: [latestGammaData.heatmapTrace.x[latestGammaData.heatmapTrace.x.length - 1], latestGammaData.heatmapTrace.x[0]],
-                    rangeslider: { visible: false }
-                },
-                yaxis: {
-                    title: "strike",
-                    range: [latestGammaData.limits.down, latestGammaData.limits.up]
-                },
-                xaxis2: {
-                    overlaying: 'x',
-                    range: latestOhlcData.mktHoursRange,
-                    rangeslider: { visible: false },
-                    anchor: 'y',
-                    showgrid: false,
-                    showticklabels: false
-                },
-                uirevision: tickerInput.value + latestGammaData.date,
-                margin: { l: 50, r: 10, b: 50, t: 50 },
-                shapes: sessionShapes,
-                plot_bgcolor: '#222',
-                paper_bgcolor: '#111',
-                font: { color: '#eee' }
-            };
-
-            const data = [latestGammaData.heatmapTrace, latestOhlcData.ohlcTrace];
-            Plotly.react(chartDiv, data, layout, { displaylogo: false });
+        function formatAbs(value) {
+            const abs = Math.abs(value || 0);
+            if (abs >= 1_000_000_000) return `${(abs / 1_000_000_000).toFixed(2)}B`;
+            if (abs >= 1_000_000) return `${(abs / 1_000_000).toFixed(2)}M`;
+            if (abs >= 1_000) return `${(abs / 1_000).toFixed(1)}K`;
+            return abs.toFixed(abs >= 10 ? 0 : 1);
         }
 
-        async function fetchGamma() {
-            const ticker = tickerInput.value;
-            const date = dateSelect.value; 
-            
-            // If we haven't loaded dates yet, don't fetch gamma
+        function formatSigned(value) {
+            if (!Number.isFinite(value)) return '-';
+            const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+            return `${sign}${formatAbs(value)}`;
+        }
+
+        function getCellStyle(value, maxAbs) {
+            if (!value || !maxAbs) return '';
+            const intensity = Math.min(0.84, Math.max(0.08, Math.log10(Math.abs(value) + 1) / Math.log10(maxAbs + 1)));
+            const rgb = value >= 0 ? (intensity > 0.62 ? '246, 211, 80' : '28, 168, 128') : (intensity > 0.62 ? '142, 76, 224' : '77, 112, 255');
+            return `background: rgba(${rgb}, ${intensity});`;
+        }
+
+        function classifyExposure(value) {
+            if (value > 0) return 'Pika / positive gamma';
+            if (value < 0) return 'Barney / negative gamma';
+            return 'Neutral';
+        }
+
+        function getLatestNodeIndex(payload) {
+            const segments = payload.daySegments?.length
+                ? payload.daySegments
+                : [{ start: 0, end: payload.heatmapTrace.x.length - 1 }];
+            return segments[segments.length - 1]?.end ?? payload.heatmapTrace.x.length - 1;
+        }
+
+        function getPreviousNodeIndex(payload, latestIndex) {
+            const segments = payload.daySegments?.length
+                ? payload.daySegments
+                : [{ start: 0, end: payload.heatmapTrace.x.length - 1 }];
+            const active = segments[segments.length - 1];
+            if (!active) return Math.max(0, latestIndex - 1);
+            return Math.max(active.start, latestIndex - 1);
+        }
+
+        function computeNodeAnalytics(payload) {
+            const latestIndex = getLatestNodeIndex(payload);
+            const previousIndex = getPreviousNodeIndex(payload, latestIndex);
+            const spot = Number(payload.spot || 0);
+            const nodes = payload.heatmapTrace.y.map((strike, rowIndex) => {
+                const row = payload.heatmapTrace.z[rowIndex] || [];
+                const value = row[latestIndex] || 0;
+                const previous = row[previousIndex] || 0;
+                return {
+                    strike,
+                    value,
+                    previous,
+                    abs: Math.abs(value),
+                    roc: value - previous,
+                    rowIndex,
+                };
+            }).sort((a, b) => b.abs - a.abs);
+
+            const king = nodes[0] || null;
+            const floor = nodes
+                .filter(node => node.strike < spot)
+                .sort((a, b) => b.abs - a.abs)[0] || null;
+            const ceiling = nodes
+                .filter(node => node.strike > spot)
+                .sort((a, b) => b.abs - a.abs)[0] || null;
+            const gatekeepers = king
+                ? nodes
+                    .filter(node => node.strike !== king.strike)
+                    .filter(node => (
+                        (node.strike > Math.min(spot, king.strike)) &&
+                        (node.strike < Math.max(spot, king.strike))
+                    ))
+                    .sort((a, b) => b.abs - a.abs)
+                    .slice(0, 3)
+                : [];
+            const maxAbs = king?.abs || 0;
+            const majorThreshold = maxAbs * 0.28;
+            const majorNodes = nodes.filter(node => node.abs >= majorThreshold);
+            const upsideMass = nodes.filter(node => node.strike > spot).reduce((sum, node) => sum + node.abs, 0);
+            const downsideMass = nodes.filter(node => node.strike < spot).reduce((sum, node) => sum + node.abs, 0);
+            const strongestRoc = [...nodes].sort((a, b) => Math.abs(b.roc) - Math.abs(a.roc))[0] || null;
+            const airPockets = findAirPockets(payload, majorThreshold, spot);
+            const rowTags = new Map();
+
+            if (king) rowTags.set(king.rowIndex, 'king-row');
+            if (floor) rowTags.set(floor.rowIndex, 'floor-row');
+            if (ceiling) rowTags.set(ceiling.rowIndex, 'ceiling-row');
+            for (const gatekeeper of gatekeepers) rowTags.set(gatekeeper.rowIndex, 'gatekeeper-row');
+
+            return {
+                spot,
+                nodes,
+                king,
+                floor,
+                ceiling,
+                gatekeepers,
+                majorNodes,
+                upsideMass,
+                downsideMass,
+                strongestRoc,
+                airPockets,
+                rowTags,
+            };
+        }
+
+        function findAirPockets(payload, majorThreshold, spot) {
+            const latestIndex = getLatestNodeIndex(payload);
+            const strikes = payload.heatmapTrace.y
+                .map((strike, rowIndex) => ({
+                    strike,
+                    abs: Math.abs((payload.heatmapTrace.z[rowIndex] || [])[latestIndex] || 0),
+                }))
+                .sort((a, b) => a.strike - b.strike);
+            const pockets = [];
+            let start = null;
+            let last = null;
+
+            for (const node of strikes) {
+                if (node.abs < majorThreshold * 0.35) {
+                    if (!start) start = node;
+                    last = node;
+                } else if (start && last && start.strike !== last.strike) {
+                    pockets.push({ low: start.strike, high: last.strike, containsSpot: spot >= start.strike && spot <= last.strike });
+                    start = null;
+                    last = null;
+                } else {
+                    start = null;
+                    last = null;
+                }
+            }
+            if (start && last && start.strike !== last.strike) {
+                pockets.push({ low: start.strike, high: last.strike, containsSpot: spot >= start.strike && spot <= last.strike });
+            }
+            return pockets.sort((a, b) => Number(b.containsSpot) - Number(a.containsSpot)).slice(0, 3);
+        }
+
+        function renderNodeDashboard(analytics) {
+            const dashboard = document.getElementById('nodeDashboard');
+            const list = document.getElementById('nodeList');
+            const bias = analytics.upsideMass > analytics.downsideMass * 1.15
+                ? 'Upside skew'
+                : analytics.downsideMass > analytics.upsideMass * 1.15
+                    ? 'Downside skew'
+                    : 'Balanced / range risk';
+
+            const card = (label, node, meta = '') => {
+                if (!node) {
+                    return `<div class="node-card"><div class="node-label">${label}</div><div class="node-value">-</div><div class="node-meta">No node found</div></div>`;
+                }
+                return `
+                    <div class="node-card ${label === 'King Node' ? 'major' : ''}">
+                        <div class="node-label">${label}</div>
+                        <div class="node-value">${node.strike}</div>
+                        <div class="node-meta">${formatSigned(node.value)} | ${classifyExposure(node.value)}</div>
+                        <div class="node-meta">${meta || `ROC ${formatSigned(node.roc)}`}</div>
+                    </div>
+                `;
+            };
+
+            dashboard.innerHTML = [
+                card('King Node', analytics.king, 'Largest absolute node on latest map'),
+                card('Floor', analytics.floor, 'Strongest node below spot'),
+                card('Ceiling', analytics.ceiling, 'Strongest node above spot'),
+                card('Fastest Reshuffle', analytics.strongestRoc, analytics.strongestRoc ? `Rate of change ${formatSigned(analytics.strongestRoc.roc)}` : ''),
+                `<div class="node-card">
+                    <div class="node-label">Map Bias</div>
+                    <div class="node-value">${bias}</div>
+                    <div class="node-meta">Spot ${analytics.spot || '-'}</div>
+                    <div class="node-meta">Upside ${formatAbs(analytics.upsideMass)} / Downside ${formatAbs(analytics.downsideMass)}</div>
+                </div>`,
+            ].join('');
+
+            const pills = [];
+            for (const node of analytics.gatekeepers) {
+                pills.push(`<span class="node-pill">Gatekeeper <strong>${node.strike}</strong> ${formatSigned(node.value)}</span>`);
+            }
+            for (const pocket of analytics.airPockets) {
+                pills.push(`<span class="node-pill">Air Pocket <strong>${pocket.low}-${pocket.high}</strong>${pocket.containsSpot ? ' near spot' : ''}</span>`);
+            }
+            for (const node of analytics.majorNodes.slice(0, 8)) {
+                pills.push(`<span class="node-pill">Major <strong>${node.strike}</strong> ${formatSigned(node.value)}</span>`);
+            }
+            list.innerHTML = pills.join('');
+        }
+
+        async function renderConfluence(date, requestId) {
+            const mode = getMode();
+            const days = getDays();
+            const tickers = confluenceTickersInput.value.trim() || 'SPY,QQQ,^SPX';
+            const datePart = date && date !== 'LIVE' ? `&date=${encodeURIComponent(date)}` : '';
+            try {
+                const data = await fetchJson(`${WORKER_URL}/api/confluence?mode=${mode}&days=${days}&tickers=${encodeURIComponent(tickers)}${datePart}`);
+                if (requestId !== activeRequestId) return;
+                const items = data.tickers.map((item) => {
+                    if (!item.ok) return `<span class="node-pill"><strong>${item.ticker}</strong> no stored map</span>`;
+                    const summary = item.summary;
+                    return `<span class="node-pill"><strong>${item.ticker}</strong> ${summary.bias} | King ${summary.king?.strike ?? '-'} | Floor ${summary.floor?.strike ?? '-'} | Ceiling ${summary.ceiling?.strike ?? '-'}</span>`;
+                });
+                document.getElementById('confluenceList').innerHTML = items.join('');
+            } catch (error) {
+                document.getElementById('confluenceList').innerHTML = `<span class="node-pill">Confluence unavailable: ${error.message}</span>`;
+            }
+        }
+
+        function getVisibleColumns(payload) {
+            const step = Number(columnStepSelect.value || 5);
+            const x = payload.heatmapTrace.x;
+            const segments = payload.daySegments?.length
+                ? payload.daySegments
+                : [{ date: payload.date, start: 0, end: x.length - 1 }];
+
+            const columns = [];
+            for (const segment of segments) {
+                for (let index = segment.start; index <= segment.end; index++) {
+                    const mte = x[index];
+                    const isBoundary = index === segment.start || index === segment.end;
+                    if (isBoundary || mte % step === 0) {
+                        columns.push({ index, mte, date: segment.date, isDayStart: index === segment.start });
+                    }
+                }
+            }
+            return columns;
+        }
+
+        function summarizeRow(row) {
+            const first = row.find(value => Number.isFinite(value)) || 0;
+            const reversed = [...row].reverse();
+            const latest = reversed.find(value => Number.isFinite(value)) || 0;
+            const delta = latest - first;
+            const deltaPct = first === 0 ? null : (delta / Math.abs(first)) * 100;
+            const maxAbs = row.reduce((max, value) => Math.max(max, Math.abs(value || 0)), 0);
+            return { first, latest, delta, deltaPct, maxAbs };
+        }
+
+        function renderGammaTable() {
+            if (!latestGammaData) return;
+
+            const payload = latestGammaData;
+            const x = payload.heatmapTrace.x;
+            const y = payload.heatmapTrace.y;
+            const z = payload.heatmapTrace.z;
+            const visibleColumns = getVisibleColumns(payload);
+            const maxAbs = z.flat().reduce((max, value) => Math.max(max, Math.abs(value || 0)), 0);
+            const analytics = computeNodeAnalytics(payload);
+            renderNodeDashboard(analytics);
+
+            if (!x.length || !y.length || !z.length) {
+                tableWrap.innerHTML = '<div id="loading">No table data available.</div>';
+                return;
+            }
+
+            const dayGroups = [];
+            for (const column of visibleColumns) {
+                const last = dayGroups[dayGroups.length - 1];
+                if (!last || last.date !== column.date) {
+                    dayGroups.push({ date: column.date, count: 1 });
+                } else {
+                    last.count += 1;
+                }
+            }
+
+            let html = '<table><thead><tr>';
+            html += '<th class="strike-col" rowspan="2">Strike</th>';
+            html += '<th class="summary-col open" rowspan="2">Open</th>';
+            html += '<th class="summary-col latest" rowspan="2">Latest</th>';
+            html += '<th class="summary-col delta" rowspan="2">Delta</th>';
+            html += '<th class="summary-col delta-pct" rowspan="2">Delta %</th>';
+            html += '<th class="summary-col max-abs" rowspan="2">Max Abs</th>';
+            for (const group of dayGroups) {
+                html += `<th class="day-header" colspan="${group.count}">${group.date}</th>`;
+            }
+            html += '</tr><tr>';
+            for (const column of visibleColumns) {
+                html += `<th class="mte-header ${column.isDayStart ? 'day-start' : ''}">${column.mte}m</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            for (let rowIndex = 0; rowIndex < y.length; rowIndex++) {
+                const row = z[rowIndex] || [];
+                const summary = summarizeRow(row);
+                html += `<tr class="${analytics.rowTags.get(rowIndex) || ''}">`;
+                html += `<th class="strike-col">${y[rowIndex]}</th>`;
+                html += `<td class="summary-col open">${formatSigned(summary.first)}</td>`;
+                html += `<td class="summary-col latest">${formatSigned(summary.latest)}</td>`;
+                html += `<td class="summary-col delta ${summary.delta >= 0 ? 'delta-up' : 'delta-down'}">${formatSigned(summary.delta)}</td>`;
+                html += `<td class="summary-col delta-pct ${summary.delta >= 0 ? 'delta-up' : 'delta-down'}">${summary.deltaPct === null ? '-' : `${summary.deltaPct.toFixed(1)}%`}</td>`;
+                html += `<td class="summary-col max-abs">${formatAbs(summary.maxAbs)}</td>`;
+
+                for (const column of visibleColumns) {
+                    const value = row[column.index] || 0;
+                    const cellClass = value > 0 ? 'cell-pos' : value < 0 ? 'cell-neg' : 'empty';
+                    html += `<td class="${cellClass} ${column.isDayStart ? 'day-start' : ''}" style="${getCellStyle(value, maxAbs)}">${formatAbs(value)}</td>`;
+                }
+                html += '</tr>';
+            }
+
+            html += '</tbody></table>';
+            tableWrap.innerHTML = html;
+            setLoading(false);
+            setLastUpdated();
+            setStatus(`Showing ${getTicker()} ${payload.dates?.length || 1} day(s), ${visibleColumns.length} visible MTE columns`);
+        }
+
+        async function fetchGamma(requestId = activeRequestId) {
+            const ticker = getTicker();
+            const date = dateSelect.value;
+
             if (!date || date === "Loading..." || date === "No Data Yet") return;
 
             try {
-                // Pass the selected date to the backend
-                const res = await fetch(`${WORKER_URL}/api/get-gamma-api?ticker=${ticker}&date=${date}`);
-                if (res.ok) {
-                    latestGammaData = await res.json();
-                    plotCombinedChart();
-                }
+                const days = getDays();
+                const mode = getMode();
+                const expirations = getExpirations();
+                const data = date === 'LIVE'
+                    ? await fetchJson(`${WORKER_URL}/api/live-exposure?ticker=${encodeURIComponent(ticker)}&mode=${mode}&expirations=${expirations}`)
+                    : await fetchJson(`${WORKER_URL}/api/get-gamma-api?ticker=${encodeURIComponent(ticker)}&mode=${mode}&date=${encodeURIComponent(date)}&days=${days}&includeFuture=false`);
+                if (requestId !== activeRequestId) return;
+                latestGammaData = data;
+                renderGammaTable();
+                renderConfluence(date, requestId);
             } catch (error) {
                 console.error('Error fetching gamma:', error);
-            }
-        }
-
-        async function fetchOhlc() {
-            const ticker = tickerInput.value;
-            const interval = intervalSelect.value;
-            try {
-                const res = await fetch(`${WORKER_URL}/api/get-ohlc?ticker=${ticker}&interval=${interval}`);
-                if (res.ok) {
-                    latestOhlcData = await res.json();
-                    plotCombinedChart();
-                }
-            } catch (error) {
-                console.error('Error fetching OHLC:', error);
+                if (requestId === activeRequestId) showError(`Gamma data failed: ${error.message}`);
             }
         }
 
         function setLoading(isLoading) {
             loadingDiv.style.display = isLoading ? 'block' : 'none';
-            chartDiv.style.display = isLoading ? 'none' : 'block';
+            tableWrap.style.display = isLoading ? 'none' : 'block';
         }
-        
+
         function startApp() {
-            console.log('Fetching data for:', dateSelect.value);
+            const requestId = ++activeRequestId;
+            latestGammaData = null;
+            showError('');
+            setStatus(`Loading ${getTicker()} table data...`);
             setLoading(true);
-            
+
             if (gammaTimer) clearInterval(gammaTimer);
-            if (ohlcTimer) clearInterval(ohlcTimer);
 
-            fetchGamma();
-            fetchOhlc();
-
-            gammaTimer = setInterval(fetchGamma, 60 * 1000); 
-            ohlcTimer = setInterval(fetchOhlc, 30 * 1000); 
+            fetchGamma(requestId);
+            gammaTimer = setInterval(() => fetchGamma(requestId), 60 * 1000);
         }
 
-        // Initialize
         tickerInput.addEventListener('change', fetchAvailableDates);
+        modeSelect.addEventListener('change', fetchAvailableDates);
         dateSelect.addEventListener('change', startApp);
-        intervalSelect.addEventListener('change', startApp);
-        
-        // On Load: Fetch dates first. That function will trigger startApp()
-        document.addEventListener('DOMContentLoaded', fetchAvailableDates);
+        expirationsInput.addEventListener('change', startApp);
+        daysInput.addEventListener('change', startApp);
+        columnStepSelect.addEventListener('change', renderGammaTable);
+        confluenceTickersInput.addEventListener('change', () => renderConfluence(dateSelect.value, activeRequestId));
 
+        document.addEventListener('DOMContentLoaded', fetchAvailableDates);
     </script>
 </body>
 </html>

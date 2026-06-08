@@ -75,39 +75,65 @@ async function getYahooAuth() {
     authRefreshPromise = null;
   }
 }
-function getStorageKey(ticker, timeZone) {
-  const now = new Date((/* @__PURE__ */ new Date()).toLocaleString("en-US", { timeZone }));
-  const year = now.getFullYear();
-  const month = (now.getMonth() + 1).toString().padStart(2, "0");
-  const day = now.getDate().toString().padStart(2, "0");
-  const dateStr = `${year}-${month}-${day}`;
-  const { mkt_hours } = getMarketStatus(timeZone);
+function getStorageKey(ticker, timeZone, now = /* @__PURE__ */ new Date(), mode = "gex") {
+  const dateStr = getDateStr(0, timeZone, now);
+  const { mkt_hours } = getMarketStatus(timeZone, now);
   return {
-    key: `data_${ticker.toUpperCase()}_${dateStr}_${mkt_hours}`,
+    key: `data_${mode.toLowerCase()}_${ticker.toUpperCase()}_${dateStr}_${mkt_hours}`,
     session: mkt_hours
   };
 }
-function getMarketStatus(timeZone) {
-  const now = new Date((/* @__PURE__ */ new Date()).toLocaleString("en-US", { timeZone }));
-  const mkt_open = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-    16,
-    30,
-    0
-  );
-  const dayOfWeek = now.getDay();
-  const nowInTZ = new Date(now.toLocaleString("en-US", { timeZone }));
-  const mktOpenInTZ = new Date(mkt_open.toLocaleString("en-US", { timeZone }));
-  const mins_passed = Math.floor(
-    (nowInTZ.getTime() - mktOpenInTZ.getTime()) / 6e4
-  );
-  if (dayOfWeek === 0 || dayOfWeek === 6)
+function getDateStr(daysAgo, timeZone, now = /* @__PURE__ */ new Date()) {
+  const parts = getZonedParts(now, timeZone);
+  const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day - daysAgo));
+  const year = shifted.getUTCFullYear();
+  const month = (shifted.getUTCMonth() + 1).toString().padStart(2, "0");
+  const day = shifted.getUTCDate().toString().padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+function getMarketStatus(timeZone, now = /* @__PURE__ */ new Date()) {
+  const parts = getZonedParts(now, timeZone);
+  const marketOpenMinute = 9 * 60 + 30;
+  const marketCloseMinute = 16 * 60;
+  const currentMinute = parts.hour * 60 + parts.minute;
+  const mins_passed = currentMinute - marketOpenMinute;
+  if (parts.dayOfWeek === 0 || parts.dayOfWeek === 6)
     return { mkt_hours: "mkt_closed", mins_passed };
-  if (mins_passed >= 0 && mins_passed <= 390)
+  if (currentMinute >= marketOpenMinute && currentMinute < marketCloseMinute)
     return { mkt_hours: "mkt_open", mins_passed };
   return { mkt_hours: "mkt_closed", mins_passed };
+}
+function getZonedParts(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    weekday: "short"
+  });
+  const values = Object.fromEntries(
+    formatter.formatToParts(date).map((part) => [part.type, part.value])
+  );
+  const dayMap = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6
+  };
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: Number(values.hour) % 24,
+    minute: Number(values.minute),
+    dayOfWeek: dayMap[values.weekday] ?? 0
+  };
 }
 function getMteList(mkt_hours, mins_passed, interval = 1) {
   if (mkt_hours === "mkt_open") {
@@ -124,7 +150,10 @@ function getMteList(mkt_hours, mins_passed, interval = 1) {
   if (mte_list.length === 0 || mte_list[mte_list.length - 1] !== 0) mte_list.push(0);
   return { mte_list, mte_len: mte_list.length };
 }
-async function calc_gamma(ticker, mte_list) {
+async function calc_exposure(ticker, mte_list, options = {}) {
+  const mode = options.mode || "gex";
+  const expirationCount = Math.max(1, Math.min(12, options.expirations || 3));
+  const now = options.now || /* @__PURE__ */ new Date();
   const { cookie, crumb } = await getYahooAuth();
   const authedHeaders = { ...YF_HEADERS, Cookie: cookie };
   const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=5m&crumb=${crumb}`;
@@ -145,58 +174,45 @@ async function calc_gamma(ticker, mte_list) {
     throw new Error(`Failed to fetch options dates: ${optionsRes.status}`);
   }
   const optionsJson = await optionsRes.json();
-  const exp_date_timestamp = optionsJson?.optionChain?.result?.[0]?.expirationDates?.[0];
-  if (!exp_date_timestamp)
+  const expirationDates = optionsJson?.optionChain?.result?.[0]?.expirationDates?.slice(0, expirationCount) || [];
+  if (expirationDates.length === 0)
     throw new Error(`Could not get expiration dates for ${ticker}`);
-  const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${exp_date_timestamp}&crumb=${crumb}`;
-  const chainRes = await fetch(chainUrl, { headers: authedHeaders });
-  if (!chainRes.ok) {
-    if (chainRes.status === 401 || chainRes.status === 403)
-      yahooAuth.expiry = 0;
-    throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
-  }
-  const chainJson = await chainRes.json();
-  const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
-  if (!chain || !chain.calls || !chain.puts) {
-    console.error(
-      "Failed to parse chain. Full API response:",
-      JSON.stringify(chainJson, null, 2)
-    );
-    throw new Error(`Could not fetch options chain for ${ticker}`);
-  }
-  const calls = chain.calls;
-  const puts = chain.puts;
-  const spot2 = spot * spot;
-  const gamma_values_c = {};
-  const gamma_values_p = {};
+  const exposureByStrike = {};
   const allStrikes = /* @__PURE__ */ new Set();
-  calls.forEach((c) => {
-    if (c.strike) allStrikes.add(c.strike);
-    gamma_values_c[c.strike] = [];
-  });
-  puts.forEach((p) => {
-    if (p.strike) allStrikes.add(p.strike);
-    gamma_values_p[p.strike] = [];
-  });
-  for (const K of allStrikes) {
-    for (const T of mte_list) {
-      const call = calls.find((c) => c.strike === K);
-      if (call) {
-        const gex_cc = (call.openInterest || 0) * (call.volume || 0);
-        const gamma_c = gamma_function_call(spot, K, T);
-        const value = Math.round(gamma_c * gex_cc * spot2 * 0.01 * 10) / 10;
-        gamma_values_c[K].push(value);
-      } else {
-        gamma_values_c[K]?.push(0);
-      }
-      const put = puts.find((p) => p.strike === K);
-      if (put) {
-        const gex_pp = (put.openInterest || 0) * (put.volume || 0);
-        const gamma_p = gamma_function_put(spot, K, T);
-        const value = Math.round(gamma_p * gex_pp * spot2 * 0.01 * 10) / 10;
-        gamma_values_p[K].push(value);
-      } else {
-        gamma_values_p[K]?.push(0);
+  for (const expiration of expirationDates) {
+    const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${expiration}&crumb=${crumb}`;
+    const chainRes = await fetch(chainUrl, { headers: authedHeaders });
+    if (!chainRes.ok) {
+      if (chainRes.status === 401 || chainRes.status === 403)
+        yahooAuth.expiry = 0;
+      throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
+    }
+    const chainJson = await chainRes.json();
+    const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
+    if (!chain || !chain.calls || !chain.puts) {
+      console.error(
+        "Failed to parse chain. Full API response:",
+        JSON.stringify(chainJson, null, 2)
+      );
+      throw new Error(`Could not fetch options chain for ${ticker}`);
+    }
+    for (const contract of [...chain.calls, ...chain.puts]) {
+      if (!contract.strike) continue;
+      allStrikes.add(contract.strike);
+      exposureByStrike[contract.strike] ||= mte_list.map(() => 0);
+    }
+    const callsByStrike = new Map(chain.calls.map((contract) => [contract.strike, contract]));
+    const putsByStrike = new Map(chain.puts.map((contract) => [contract.strike, contract]));
+    for (const K of allStrikes) {
+      exposureByStrike[K] ||= mte_list.map(() => 0);
+      const call = callsByStrike.get(K);
+      const put = putsByStrike.get(K);
+      for (let i = 0; i < mte_list.length; i++) {
+        const projectedMinutesElapsed = 390 - mte_list[i];
+        const minutesToExpiration = getMinutesToExpiration(expiration, now, projectedMinutesElapsed);
+        const callValue = call ? calcContractExposure(mode, "call", spot, K, minutesToExpiration, call) : 0;
+        const putValue = put ? calcContractExposure(mode, "put", spot, K, minutesToExpiration, put) : 0;
+        exposureByStrike[K][i] += callValue + putValue;
       }
     }
   }
@@ -206,80 +222,44 @@ async function calc_gamma(ticker, mte_list) {
     values: []
   };
   df.index.forEach((strike) => {
-    const call_row = gamma_values_c[strike] || mte_list.map(() => 0);
-    const put_row = gamma_values_p[strike] || mte_list.map(() => 0);
-    const combined_row = call_row.map((call_val, i) => {
-      const put_val = put_row[i] || 0;
-      return (call_val || 0) + (put_val || 0);
-    });
-    df.values.push(combined_row);
+    df.values.push((exposureByStrike[strike] || mte_list.map(() => 0)).map((value) => Math.round(value * 10) / 10));
   });
   return { df, spot };
 }
-function gamma_function_call(S, K, T) {
-  const r = 0.05;
-  const sigma = 0.2;
-  const N = 10;
-  const T_yrs = T / (365 * 24 * 60);
-  const dt = T_yrs / N;
-  if (dt <= 0) return 0;
-  const u = Math.exp(sigma * Math.sqrt(dt));
-  const d = 1 / u;
-  const p = (Math.exp(r * dt) - d) / (u - d);
-  if (p < 0 || p > 1 || isNaN(p)) return 0;
-  const V0 = binomial_price(S, K, T_yrs, r, sigma, N, "call");
-  const V_u = binomial_price(S * u, K, T_yrs - dt, r, sigma, N - 1, "call");
-  const V_d = binomial_price(S * d, K, T_yrs - dt, r, sigma, N - 1, "call");
-  const delta_up = (V_u - V0) / (S * u - S);
-  const delta_down = (V0 - V_d) / (S - S * d);
-  const gamma = (delta_up - delta_down) / (0.5 * (S * u - S * d));
-  return isNaN(gamma) ? 0 : gamma;
+function getMinutesToExpiration(expirationTimestampSeconds, now, projectedMinutesElapsed) {
+  const expirationMs = expirationTimestampSeconds * 1e3;
+  const projectedNowMs = now.getTime() + projectedMinutesElapsed * 6e4;
+  return Math.max(1, (expirationMs - projectedNowMs) / 6e4);
 }
-function gamma_function_put(S, K, T) {
-  const r = 0.05;
-  const sigma = 0.2;
-  const N = 10;
-  const T_yrs = T / (365 * 24 * 60);
-  const dt = T_yrs / N;
-  if (dt <= 0) return 0;
-  const u = Math.exp(sigma * Math.sqrt(dt));
-  const d = 1 / u;
-  const p = (Math.exp(r * dt) - d) / (u - d);
-  if (p < 0 || p > 1 || isNaN(p)) return 0;
-  const V0 = binomial_price(S, K, T_yrs, r, sigma, N, "put");
-  const V_u = binomial_price(S * u, K, T_yrs - dt, r, sigma, N - 1, "put");
-  const V_d = binomial_price(S * d, K, T_yrs - dt, r, sigma, N - 1, "put");
-  const delta_up = (V_u - V0) / (S * u - S);
-  const delta_down = (V0 - V_d) / (S - S * d);
-  const gamma = (delta_up - delta_down) / (0.5 * (S * u - S * d));
-  return isNaN(gamma) ? 0 : gamma;
+function calcContractExposure(mode, type, S, K, minutesToExpiration, contract) {
+  const sigma = Number(contract.impliedVolatility) > 0 ? Number(contract.impliedVolatility) : 0.2;
+  const openInterest = Number(contract.openInterest || 0);
+  const volume = Number(contract.volume || 0);
+  const contractCount = openInterest + volume * 0.25;
+  if (!contractCount) return 0;
+  const sign = type === "call" ? 1 : -1;
+  if (mode === "vex") {
+    const vanna = blackScholesVanna(S, K, minutesToExpiration, sigma);
+    return sign * vanna * contractCount * S * 0.01;
+  }
+  const gamma = blackScholesGamma(S, K, minutesToExpiration, sigma);
+  return sign * gamma * contractCount * S * S * 0.01;
 }
-function binomial_price(S, K, T, r, sigma, N, type) {
-  if (N <= 0 || T <= 0) {
-    if (type === "call") return Math.max(0, S - K);
-    else return Math.max(0, K - S);
-  }
-  const dt = T / N;
-  const u = Math.exp(sigma * Math.sqrt(dt));
-  const d = 1 / u;
-  const p = (Math.exp(r * dt) - d) / (u - d);
-  if (p < 0 || p > 1 || isNaN(p))
-    return type === "call" ? Math.max(0, S - K) : Math.max(0, K - S);
-  const df = Math.exp(-r * dt);
-  let option_values = new Array(N + 1);
-  for (let j = 0; j <= N; j++) {
-    const ST = S * Math.pow(u, j) * Math.pow(d, N - j);
-    option_values[j] = type === "call" ? Math.max(0, ST - K) : Math.max(0, K - ST);
-  }
-  for (let i = N - 1; i >= 0; i--) {
-    for (let j = 0; j <= i; j++) {
-      const ST = S * Math.pow(u, j) * Math.pow(d, i - j);
-      const intrinsic_value = type === "call" ? Math.max(0, ST - K) : Math.max(0, K - ST);
-      const expected_value = df * (p * option_values[j + 1] + (1 - p) * option_values[j]);
-      option_values[j] = Math.max(intrinsic_value, expected_value);
-    }
-  }
-  return option_values[0];
+function blackScholesGamma(S, K, minutesToExpiration, sigma, r = 0.05) {
+  const T = minutesToExpiration / (365 * 24 * 60);
+  if (S <= 0 || K <= 0 || T <= 0 || sigma <= 0) return 0;
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  return normalPdf(d1) / (S * sigma * Math.sqrt(T));
+}
+function blackScholesVanna(S, K, minutesToExpiration, sigma, r = 0.05) {
+  const T = minutesToExpiration / (365 * 24 * 60);
+  if (S <= 0 || K <= 0 || T <= 0 || sigma <= 0) return 0;
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  const d2 = d1 - sigma * Math.sqrt(T);
+  return -normalPdf(d1) * d2 / sigma;
+}
+function normalPdf(x) {
+  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
 }
 function getChartLimits(df, mte_len) {
   const y_axis_strikes = df.index;
@@ -388,6 +368,154 @@ async function makeCS(ticker, interval, mkt_hours) {
 var APP_TIMEZONE = "America/New_York";
 var DAYS_OF_DATA_TO_KEEP = 20;
 var TICKER = "SPY";
+function normalizeTicker(input) {
+  const ticker = (input || TICKER).trim().toUpperCase();
+  if (!/^[A-Z0-9.^-]{1,12}$/.test(ticker)) {
+    throw new Error("Invalid ticker");
+  }
+  return ticker;
+}
+function normalizeInterval(input) {
+  const interval = input || "5m";
+  if (!["1m", "2m", "5m", "15m", "30m"].includes(interval)) {
+    throw new Error("Invalid interval");
+  }
+  return interval;
+}
+function normalizeDate(input) {
+  if (!input) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    throw new Error("Invalid date");
+  }
+  const parsed = /* @__PURE__ */ new Date(`${input}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== input) {
+    throw new Error("Invalid date");
+  }
+  return input;
+}
+function normalizeDays(input) {
+  const days = Number(input || "1");
+  if (!Number.isInteger(days) || days < 1 || days > 10) {
+    throw new Error("Invalid days");
+  }
+  return days;
+}
+function normalizeExpirations(input) {
+  const expirations = Number(input || "3");
+  if (!Number.isInteger(expirations) || expirations < 1 || expirations > 12) {
+    throw new Error("Invalid expirations");
+  }
+  return expirations;
+}
+function normalizeMode(input) {
+  const mode = (input || "gex").toLowerCase();
+  if (mode !== "gex" && mode !== "vex") {
+    throw new Error("Invalid mode");
+  }
+  return mode;
+}
+function storagePrefix(ticker, mode) {
+  return `data_${mode}_${ticker}_`;
+}
+function legacyStoragePrefix(ticker) {
+  return `data_${ticker}_`;
+}
+function getDateFromStorageKey(key, ticker, mode) {
+  if (key.startsWith(storagePrefix(ticker, mode))) return key.split("_")[3] || null;
+  if (mode === "gex" && key.startsWith(legacyStoragePrefix(ticker))) return key.split("_")[2] || null;
+  return null;
+}
+function keyMatchesDate(key, ticker, mode, date) {
+  return key.startsWith(`${storagePrefix(ticker, mode)}${date}_`) || mode === "gex" && key.startsWith(`${legacyStoragePrefix(ticker)}${date}_`);
+}
+function validateChartPayload(payload) {
+  const x = payload.heatmapTrace?.x || [];
+  const y = payload.heatmapTrace?.y || [];
+  const z = payload.heatmapTrace?.z || [];
+  const issues = [];
+  if (x.length === 0) issues.push("heatmap x-axis is empty");
+  if (y.length === 0) issues.push("heatmap y-axis is empty");
+  if (z.length !== y.length) issues.push(`z row count ${z.length} does not match y length ${y.length}`);
+  for (let rowIndex = 0; rowIndex < z.length; rowIndex++) {
+    const row = z[rowIndex] || [];
+    if (row.length !== x.length) {
+      issues.push(`z row ${rowIndex} length ${row.length} does not match x length ${x.length}`);
+      break;
+    }
+    if (row.some((value) => !Number.isFinite(value))) {
+      issues.push(`z row ${rowIndex} contains non-finite values`);
+      break;
+    }
+  }
+  if (x.some((value) => !Number.isFinite(value))) issues.push("x-axis contains non-finite values");
+  if (y.some((value) => !Number.isFinite(value))) issues.push("y-axis contains non-finite values");
+  if (!Number.isFinite(payload.spot) || payload.spot <= 0) issues.push("spot is missing or invalid");
+  if (!Number.isFinite(payload.limits?.up) || !Number.isFinite(payload.limits?.down)) {
+    issues.push("limits are missing or invalid");
+  } else if (payload.limits.down >= payload.limits.up) {
+    issues.push("limit down is not below limit up");
+  }
+  const segments = payload.daySegments?.length ? payload.daySegments : [{ date: payload.date, start: 0, end: x.length - 1 }];
+  for (const segment of segments) {
+    const segmentX = x.slice(segment.start, segment.end + 1);
+    const duplicateX = segmentX.filter((value, index) => segmentX.indexOf(value) !== index);
+    if (duplicateX.length > 0) issues.push(`x-axis contains duplicate MTE buckets for ${segment.date}`);
+    const xMonotonic = segmentX.every((value, index) => index === 0 || value <= segmentX[index - 1]);
+    if (!xMonotonic) issues.push(`x-axis MTE values are not monotonically descending for ${segment.date}`);
+  }
+  const yDescending = y.every((value, index) => index === 0 || value <= y[index - 1]);
+  if (!yDescending) issues.push("y-axis strikes are not monotonically descending");
+  return {
+    ok: issues.length === 0,
+    issues,
+    summary: {
+      date: payload.date,
+      xBuckets: x.length,
+      strikes: y.length,
+      sessionMarkers: payload.sessionMarkers?.length || 0,
+      days: payload.dates?.length || payload.daySegments?.length || 1,
+      spot: payload.spot,
+      limits: payload.limits
+    }
+  };
+}
+function summarizeConfluence(payload) {
+  const x = payload.heatmapTrace?.x || [];
+  const y = payload.heatmapTrace?.y || [];
+  const z = payload.heatmapTrace?.z || [];
+  const latestIndex = payload.daySegments?.length ? payload.daySegments[payload.daySegments.length - 1].end : x.length - 1;
+  const spot = payload.spot;
+  const nodes = y.map((strike, rowIndex) => {
+    const value = z[rowIndex]?.[latestIndex] || 0;
+    return { strike, value, abs: Math.abs(value) };
+  }).sort((a, b) => b.abs - a.abs);
+  const king = nodes[0] || null;
+  const floor = nodes.filter((node) => node.strike < spot).sort((a, b) => b.abs - a.abs)[0] || null;
+  const ceiling = nodes.filter((node) => node.strike > spot).sort((a, b) => b.abs - a.abs)[0] || null;
+  const upsideMass = nodes.filter((node) => node.strike > spot).reduce((sum, node) => sum + node.abs, 0);
+  const downsideMass = nodes.filter((node) => node.strike < spot).reduce((sum, node) => sum + node.abs, 0);
+  const bias = upsideMass > downsideMass * 1.15 ? "upside" : downsideMass > upsideMass * 1.15 ? "downside" : "balanced";
+  return {
+    date: payload.date,
+    mode: payload.mode || "gex",
+    spot,
+    king,
+    floor,
+    ceiling,
+    bias,
+    upsideMass,
+    downsideMass
+  };
+}
+function isAuthorizedCron(request, env) {
+  if (!env.ADMIN_SECRET) return false;
+  const url = new URL(request.url);
+  const authHeader = request.headers.get("Authorization") || "";
+  const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
+  const headerSecret = request.headers.get("X-Admin-Secret") || "";
+  const querySecret = url.searchParams.get("secret") || "";
+  return [bearer, headerSecret, querySecret].includes(env.ADMIN_SECRET);
+}
 var HeatmapBuilderDO = class {
   state;
   constructor(state) {
@@ -397,7 +525,9 @@ var HeatmapBuilderDO = class {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/api/v1/addStrip") {
       const newData = await request.json();
-      const { key } = getStorageKey(newData.ticker, APP_TIMEZONE);
+      const ticker = normalizeTicker(newData.ticker);
+      const mode = normalizeMode(newData.mode || "gex");
+      const { key } = getStorageKey(ticker, APP_TIMEZONE, /* @__PURE__ */ new Date(), mode);
       let sessionData = await this.state.storage.get(key) || {
         y_strikes: newData.futureMap.y_strikes,
         // Initialize with FIRST strip's strikes
@@ -434,59 +564,97 @@ var HeatmapBuilderDO = class {
     }
     if (request.method === "GET" && url.pathname === "/api/v1/getChartData") {
       const requestedDate = url.searchParams.get("date");
+      const ticker = normalizeTicker(url.searchParams.get("ticker"));
+      const mode = normalizeMode(url.searchParams.get("mode"));
+      const targetRequestedDate = normalizeDate(requestedDate);
+      const days = normalizeDays(url.searchParams.get("days"));
+      const includeFuture = url.searchParams.get("includeFuture") !== "false";
       const listMap = await this.state.storage.list({
-        prefix: `data_${TICKER}_`
+        prefix: storagePrefix(ticker, mode)
       });
+      if (mode === "gex") {
+        const legacyMap = await this.state.storage.list({
+          prefix: legacyStoragePrefix(ticker)
+        });
+        for (const [key, value] of legacyMap) listMap.set(key, value);
+      }
       if (listMap.size === 0) {
         return new Response(JSON.stringify({ error: "No data available" }), { status: 404 });
       }
       const allKeys = Array.from(listMap.keys()).sort();
-      const uniqueDates = [...new Set(allKeys.map((k) => k.split("_")[2]))];
-      const targetDate = requestedDate || uniqueDates[uniqueDates.length - 1];
-      const keysForDate = allKeys.filter((k) => k.includes(targetDate));
-      if (keysForDate.length === 0) {
+      const uniqueDates = [...new Set(allKeys.map((k) => getDateFromStorageKey(k, ticker, mode)).filter(Boolean))].sort();
+      const endDate = targetRequestedDate || uniqueDates[uniqueDates.length - 1];
+      const endDateIndex = uniqueDates.indexOf(endDate);
+      if (endDateIndex === -1) {
         return new Response(JSON.stringify({ error: "No data for date" }), { status: 404 });
       }
+      const targetDates = uniqueDates.slice(Math.max(0, endDateIndex - days + 1), endDateIndex + 1);
+      const keysForWindow = allKeys.filter(
+        (key) => targetDates.some((date) => keyMatchesDate(key, ticker, mode, date))
+      );
+      if (keysForWindow.length === 0) {
+        return new Response(JSON.stringify({ error: "No data for date" }), { status: 404 });
+      }
+      const y_strikes = Array.from(new Set(
+        keysForWindow.flatMap((key) => listMap.get(key)?.y_strikes || [])
+      )).sort((a, b) => b - a);
       const combined_x_mte = [];
-      const combined_z_values = [];
+      const combined_z_values = y_strikes.map(() => []);
       const sessionMarkers = [];
+      const daySegments = [];
       let lastKnownSpot = 0;
       let lastKnownLimits = { up: 0, down: 0 };
-      let y_strikes = [];
       let latestSession = null;
-      for (const key of keysForDate) {
-        const sessionData = listMap.get(key);
-        if (!sessionData || !sessionData.mtes) continue;
-        const sessionName = key.split("_").pop() || "session";
-        if (combined_x_mte.length > 0) {
-          sessionMarkers.push({
-            x: combined_x_mte[combined_x_mte.length - 1],
-            label: sessionName
-          });
-        }
-        if (combined_z_values.length === 0) {
-          y_strikes = sessionData.y_strikes;
-          for (let i = 0; i < y_strikes.length; i++) combined_z_values.push([]);
-        }
-        combined_x_mte.push(...sessionData.mtes);
-        for (let i = 0; i < y_strikes.length; i++) {
-          for (const strip of sessionData.strips) {
-            combined_z_values[i].push(strip[i] || 0);
+      for (const date of targetDates) {
+        const dayStart = combined_x_mte.length;
+        const keysForDate = allKeys.filter((key) => keyMatchesDate(key, ticker, mode, date));
+        for (const key of keysForDate) {
+          const sessionData = listMap.get(key);
+          if (!sessionData || !sessionData.mtes) continue;
+          const sessionName = key.split("_").pop() || "session";
+          if (combined_x_mte.length > 0) {
+            sessionMarkers.push({
+              x: combined_x_mte[combined_x_mte.length - 1],
+              label: sessionName,
+              date
+            });
           }
+          const historicalPairs = sessionData.mtes.map((mte, index) => ({ mte, strip: sessionData.strips[index] })).filter((pair) => pair.strip).sort((a, b) => b.mte - a.mte);
+          combined_x_mte.push(...historicalPairs.map((pair) => pair.mte));
+          for (let i = 0; i < y_strikes.length; i++) {
+            const strike = y_strikes[i];
+            const sessionStrikeIndex = sessionData.y_strikes.indexOf(strike);
+            for (const { strip } of historicalPairs) {
+              combined_z_values[i].push(sessionStrikeIndex === -1 ? 0 : strip[sessionStrikeIndex] || 0);
+            }
+          }
+          latestSession = { date, data: sessionData };
         }
-        latestSession = sessionData;
+        if (combined_x_mte.length > dayStart) {
+          daySegments.push({ date, start: dayStart, end: combined_x_mte.length - 1 });
+        }
       }
-      if (latestSession && latestSession.future_x_mte && latestSession.future_x_mte.length > 0) {
-        combined_x_mte.push(...latestSession.future_x_mte);
+      if (latestSession) {
+        lastKnownSpot = latestSession.data.spot;
+        lastKnownLimits = latestSession.data.limits;
+      }
+      if (includeFuture && latestSession && latestSession.data.future_x_mte && latestSession.data.future_x_mte.length > 0) {
+        const activeSegment = daySegments[daySegments.length - 1];
+        combined_x_mte.push(...latestSession.data.future_x_mte);
         for (let i = 0; i < y_strikes.length; i++) {
-          const futureRow = latestSession.future_z_values[i] || [];
-          combined_z_values[i].push(...futureRow);
+          const strike = y_strikes[i];
+          const sessionStrikeIndex = latestSession.data.y_strikes.indexOf(strike);
+          const futureRow = sessionStrikeIndex === -1 ? [] : latestSession.data.future_z_values[sessionStrikeIndex] || [];
+          combined_z_values[i].push(...latestSession.data.future_x_mte.map((_, index) => futureRow[index] || 0));
         }
-        lastKnownSpot = latestSession.spot;
-        lastKnownLimits = latestSession.limits;
+        if (activeSegment && latestSession.date === activeSegment.date) {
+          activeSegment.end = combined_x_mte.length - 1;
+        }
       }
       const payload = {
-        date: targetDate,
+        date: endDate,
+        dates: targetDates,
+        mode,
         heatmapTrace: {
           type: "heatmap",
           x: combined_x_mte,
@@ -498,16 +666,23 @@ var HeatmapBuilderDO = class {
         },
         limits: lastKnownLimits,
         spot: lastKnownSpot,
-        sessionMarkers
+        sessionMarkers,
+        daySegments
       };
       return new Response(JSON.stringify(payload), {
         headers: { "Content-Type": "application/json" }
       });
     }
     if (request.method === "GET" && url.pathname === "/api/v1/getAvailableDates") {
-      const listMap = await this.state.storage.list({ prefix: `data_${TICKER}_` });
+      const ticker = normalizeTicker(url.searchParams.get("ticker"));
+      const mode = normalizeMode(url.searchParams.get("mode"));
+      const listMap = await this.state.storage.list({ prefix: storagePrefix(ticker, mode) });
+      if (mode === "gex") {
+        const legacyMap = await this.state.storage.list({ prefix: legacyStoragePrefix(ticker) });
+        for (const [key, value] of legacyMap) listMap.set(key, value);
+      }
       const allKeys = Array.from(listMap.keys());
-      const uniqueDates = [...new Set(allKeys.map((k) => k.split("_")[2]))].sort();
+      const uniqueDates = [...new Set(allKeys.map((k) => getDateFromStorageKey(k, ticker, mode)).filter(Boolean))].sort();
       return new Response(JSON.stringify(uniqueDates), {
         headers: { "Content-Type": "application/json" }
       });
@@ -551,34 +726,103 @@ var index_default = {
         headers: {
           "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type"
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Admin-Secret"
         }
       });
     }
     const url = new URL(request.url);
     try {
       if (url.pathname === "/__cron") {
+        if (!isAuthorizedCron(request, env)) {
+          return addCORSHeaders(new Response("Unauthorized", { status: 401 }));
+        }
         await this.scheduled(null, env, ctx);
-        return new Response("Cron Ran");
+        return addCORSHeaders(new Response("Cron Ran"));
       }
       if (url.pathname === "/api/get-gamma-api") {
-        const ticker = url.searchParams.get("ticker")?.toUpperCase() || TICKER;
-        const requestedDate = url.searchParams.get("date");
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const mode = normalizeMode(url.searchParams.get("mode"));
+        const requestedDate = normalizeDate(url.searchParams.get("date"));
+        const days = normalizeDays(url.searchParams.get("days"));
         const doId = env.GEX_HISTORY_DO.idFromName(ticker);
         const stub = env.GEX_HISTORY_DO.get(doId);
-        let doUrl = "https://dummy/api/v1/getChartData";
-        if (requestedDate) doUrl += `?date=${requestedDate}`;
+        const includeFuture = url.searchParams.get("includeFuture");
+        let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}`;
+        if (requestedDate) doUrl += `&date=${requestedDate}`;
+        if (includeFuture === "false") doUrl += "&includeFuture=false";
         return addCORSHeaders(await stub.fetch(doUrl));
       }
-      if (url.pathname === "/api/get-dates") {
-        const ticker = url.searchParams.get("ticker")?.toUpperCase() || TICKER;
+      if (url.pathname === "/api/diagnostics") {
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const mode = normalizeMode(url.searchParams.get("mode"));
+        const requestedDate = normalizeDate(url.searchParams.get("date"));
+        const days = normalizeDays(url.searchParams.get("days"));
         const doId = env.GEX_HISTORY_DO.idFromName(ticker);
         const stub = env.GEX_HISTORY_DO.get(doId);
-        return addCORSHeaders(await stub.fetch("https://dummy/api/v1/getAvailableDates"));
+        let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}`;
+        if (requestedDate) doUrl += `&date=${requestedDate}`;
+        const chartResponse = await stub.fetch(doUrl);
+        if (!chartResponse.ok) return addCORSHeaders(chartResponse);
+        const payload = await chartResponse.json();
+        return addCORSHeaders(new Response(JSON.stringify(validateChartPayload(payload)), {
+          headers: { "Content-Type": "application/json" }
+        }));
+      }
+      if (url.pathname === "/api/get-dates") {
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const mode = normalizeMode(url.searchParams.get("mode"));
+        const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+        const stub = env.GEX_HISTORY_DO.get(doId);
+        return addCORSHeaders(await stub.fetch(`https://dummy/api/v1/getAvailableDates?ticker=${encodeURIComponent(ticker)}&mode=${mode}`));
+      }
+      if (url.pathname === "/api/confluence") {
+        const mode = normalizeMode(url.searchParams.get("mode"));
+        const requestedDate = normalizeDate(url.searchParams.get("date"));
+        const days = normalizeDays(url.searchParams.get("days"));
+        const tickers = (url.searchParams.get("tickers") || "SPY,QQQ,^SPX").split(",").map((ticker) => normalizeTicker(ticker)).slice(0, 5);
+        const results = await Promise.all(tickers.map(async (ticker) => {
+          const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+          const stub = env.GEX_HISTORY_DO.get(doId);
+          let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}&includeFuture=false`;
+          if (requestedDate) doUrl += `&date=${requestedDate}`;
+          const response = await stub.fetch(doUrl);
+          if (!response.ok) return { ticker, ok: false, error: await response.text() };
+          const payload = await response.json();
+          return { ticker, ok: true, summary: summarizeConfluence(payload) };
+        }));
+        return addCORSHeaders(new Response(JSON.stringify({ mode, tickers: results }), {
+          headers: { "Content-Type": "application/json" }
+        }));
+      }
+      if (url.pathname === "/api/live-exposure") {
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const mode = normalizeMode(url.searchParams.get("mode"));
+        const expirations = normalizeExpirations(url.searchParams.get("expirations"));
+        const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
+        const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
+        const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations });
+        const { limit_up, limit_down } = getChartLimits(df, mte_len);
+        const payload = {
+          date: getDateStr(0, APP_TIMEZONE),
+          dates: [getDateStr(0, APP_TIMEZONE)],
+          mode,
+          heatmapTrace: {
+            x: df.columns,
+            y: df.index,
+            z: df.values
+          },
+          limits: { up: limit_up, down: limit_down },
+          spot,
+          sessionMarkers: [],
+          daySegments: [{ date: getDateStr(0, APP_TIMEZONE), start: 0, end: df.columns.length - 1 }]
+        };
+        return addCORSHeaders(new Response(JSON.stringify(payload), {
+          headers: { "Content-Type": "application/json" }
+        }));
       }
       if (url.pathname === "/api/get-ohlc") {
-        const ticker = url.searchParams.get("ticker")?.toUpperCase() || TICKER;
-        const interval = url.searchParams.get("interval") || "5m";
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const interval = normalizeInterval(url.searchParams.get("interval"));
         const { mkt_hours } = getMarketStatus(APP_TIMEZONE);
         const { ohlc, mktHoursRange } = await makeCS(ticker, interval, mkt_hours);
         const ohlcTrace = {
@@ -613,43 +857,54 @@ var index_default = {
     const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
     if (mkt_hours !== "mkt_open") return;
     const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
-    const { df, spot } = await calc_gamma(TICKER, mte_list);
-    const { limit_up, limit_down } = getChartLimits(df, mte_len);
     const current_bucket_mins = Math.floor(mins_passed);
     const target_mte = 390 - current_bucket_mins;
-    const splitIndex = df.columns.indexOf(target_mte);
-    if (splitIndex === -1) {
-      console.log(`Target MTE ${target_mte} not found in grid.`);
-      return;
+    for (const mode of ["gex", "vex"]) {
+      const { df, spot } = await calc_exposure(TICKER, mte_list, { mode, expirations: 3 });
+      const { limit_up, limit_down } = getChartLimits(df, mte_len);
+      const splitIndex = df.columns.indexOf(target_mte);
+      if (splitIndex === -1) {
+        console.log(`Target MTE ${target_mte} not found in ${mode} grid.`);
+        continue;
+      }
+      const historical_z_strip = df.values.map((row) => row[splitIndex]);
+      const future_columns = df.columns.slice(splitIndex + 1);
+      const future_z_values = df.values.map((row) => row.slice(splitIndex + 1));
+      const stripData = {
+        ticker: TICKER,
+        mode,
+        historicalStrip: {
+          x_mte: target_mte,
+          z_strip: historical_z_strip
+        },
+        futureMap: {
+          x_mte: future_columns,
+          y_strikes: df.index,
+          z_values: future_z_values
+        },
+        limits: { up: limit_up, down: limit_down },
+        spot
+      };
+      const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
+      const stub = env.GEX_HISTORY_DO.get(doId);
+      ctx.waitUntil(stub.fetch("https://dummy/api/v1/addStrip", {
+        method: "POST",
+        body: JSON.stringify(stripData),
+        headers: { "Content-Type": "application/json" }
+      }));
     }
-    const historical_z_strip = df.values.map((row) => row[splitIndex]);
-    const future_columns = df.columns.slice(splitIndex + 1);
-    const future_z_values = df.values.map((row) => row.slice(splitIndex + 1));
-    const stripData = {
-      ticker: TICKER,
-      historicalStrip: {
-        x_mte: target_mte,
-        z_strip: historical_z_strip
-      },
-      futureMap: {
-        x_mte: future_columns,
-        y_strikes: df.index,
-        z_values: future_z_values
-      },
-      limits: { up: limit_up, down: limit_down },
-      spot
-    };
-    const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
-    const stub = env.GEX_HISTORY_DO.get(doId);
-    ctx.waitUntil(stub.fetch("https://dummy/api/v1/addStrip", {
-      method: "POST",
-      body: JSON.stringify(stripData),
-      headers: { "Content-Type": "application/json" }
-    }));
   }
 };
 export {
   HeatmapBuilderDO,
-  index_default as default
+  index_default as default,
+  normalizeDate,
+  normalizeDays,
+  normalizeExpirations,
+  normalizeInterval,
+  normalizeMode,
+  normalizeTicker,
+  summarizeConfluence,
+  validateChartPayload
 };
 //# sourceMappingURL=_worker.js.map

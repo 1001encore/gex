@@ -11,7 +11,8 @@ import {
 } from '@cloudflare/workers-types';
 
 import {
-  calc_gamma,
+  calc_exposure,
+  ExposureMode,
   getMteList,
   getMarketStatus,
   getChartLimits,
@@ -37,7 +38,8 @@ interface SessionData {
 }
 
 interface NewStripData {
-  ticker: string;       // <--- ADD THIS LINE
+  ticker: string;
+  mode?: ExposureMode;
   historicalStrip: {
     x_mte: number;
     z_strip: number[];
@@ -49,6 +51,200 @@ interface NewStripData {
   };
   limits: { up: number; down: number };
   spot: number;
+}
+
+interface ChartPayload {
+  date: string;
+  dates?: string[];
+  mode?: ExposureMode;
+  heatmapTrace: {
+    x: number[];
+    y: number[];
+    z: number[][];
+  };
+  limits: { up: number; down: number };
+  spot: number;
+  sessionMarkers: { x: number; label: string; date?: string }[];
+  daySegments?: { date: string; start: number; end: number }[];
+}
+
+export function normalizeTicker(input: string | null): string {
+  const ticker = (input || TICKER).trim().toUpperCase();
+  if (!/^[A-Z0-9.^-]{1,12}$/.test(ticker)) {
+    throw new Error('Invalid ticker');
+  }
+  return ticker;
+}
+
+export function normalizeInterval(input: string | null): '1m' | '2m' | '5m' | '15m' | '30m' {
+  const interval = input || '5m';
+  if (!['1m', '2m', '5m', '15m', '30m'].includes(interval)) {
+    throw new Error('Invalid interval');
+  }
+  return interval as '1m' | '2m' | '5m' | '15m' | '30m';
+}
+
+export function normalizeDate(input: string | null): string | null {
+  if (!input) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    throw new Error('Invalid date');
+  }
+  const parsed = new Date(`${input}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== input) {
+    throw new Error('Invalid date');
+  }
+  return input;
+}
+
+export function normalizeDays(input: string | null): number {
+  const days = Number(input || '1');
+  if (!Number.isInteger(days) || days < 1 || days > 10) {
+    throw new Error('Invalid days');
+  }
+  return days;
+}
+
+export function normalizeExpirations(input: string | null): number {
+  const expirations = Number(input || '3');
+  if (!Number.isInteger(expirations) || expirations < 1 || expirations > 12) {
+    throw new Error('Invalid expirations');
+  }
+  return expirations;
+}
+
+export function normalizeMode(input: string | null): ExposureMode {
+  const mode = (input || 'gex').toLowerCase();
+  if (mode !== 'gex' && mode !== 'vex') {
+    throw new Error('Invalid mode');
+  }
+  return mode;
+}
+
+function storagePrefix(ticker: string, mode: ExposureMode): string {
+  return `data_${mode}_${ticker}_`;
+}
+
+function legacyStoragePrefix(ticker: string): string {
+  return `data_${ticker}_`;
+}
+
+function getDateFromStorageKey(key: string, ticker: string, mode: ExposureMode): string | null {
+  if (key.startsWith(storagePrefix(ticker, mode))) return key.split('_')[3] || null;
+  if (mode === 'gex' && key.startsWith(legacyStoragePrefix(ticker))) return key.split('_')[2] || null;
+  return null;
+}
+
+function keyMatchesDate(key: string, ticker: string, mode: ExposureMode, date: string): boolean {
+  return key.startsWith(`${storagePrefix(ticker, mode)}${date}_`)
+    || (mode === 'gex' && key.startsWith(`${legacyStoragePrefix(ticker)}${date}_`));
+}
+
+export function validateChartPayload(payload: ChartPayload) {
+  const x = payload.heatmapTrace?.x || [];
+  const y = payload.heatmapTrace?.y || [];
+  const z = payload.heatmapTrace?.z || [];
+  const issues: string[] = [];
+
+  if (x.length === 0) issues.push('heatmap x-axis is empty');
+  if (y.length === 0) issues.push('heatmap y-axis is empty');
+  if (z.length !== y.length) issues.push(`z row count ${z.length} does not match y length ${y.length}`);
+
+  for (let rowIndex = 0; rowIndex < z.length; rowIndex++) {
+    const row = z[rowIndex] || [];
+    if (row.length !== x.length) {
+      issues.push(`z row ${rowIndex} length ${row.length} does not match x length ${x.length}`);
+      break;
+    }
+    if (row.some((value) => !Number.isFinite(value))) {
+      issues.push(`z row ${rowIndex} contains non-finite values`);
+      break;
+    }
+  }
+
+  if (x.some((value) => !Number.isFinite(value))) issues.push('x-axis contains non-finite values');
+  if (y.some((value) => !Number.isFinite(value))) issues.push('y-axis contains non-finite values');
+  if (!Number.isFinite(payload.spot) || payload.spot <= 0) issues.push('spot is missing or invalid');
+  if (!Number.isFinite(payload.limits?.up) || !Number.isFinite(payload.limits?.down)) {
+    issues.push('limits are missing or invalid');
+  } else if (payload.limits.down >= payload.limits.up) {
+    issues.push('limit down is not below limit up');
+  }
+
+  const segments = payload.daySegments?.length
+    ? payload.daySegments
+    : [{ date: payload.date, start: 0, end: x.length - 1 }];
+
+  for (const segment of segments) {
+    const segmentX = x.slice(segment.start, segment.end + 1);
+    const duplicateX = segmentX.filter((value, index) => segmentX.indexOf(value) !== index);
+    if (duplicateX.length > 0) issues.push(`x-axis contains duplicate MTE buckets for ${segment.date}`);
+
+    const xMonotonic = segmentX.every((value, index) => index === 0 || value <= segmentX[index - 1]);
+    if (!xMonotonic) issues.push(`x-axis MTE values are not monotonically descending for ${segment.date}`);
+  }
+
+  const yDescending = y.every((value, index) => index === 0 || value <= y[index - 1]);
+  if (!yDescending) issues.push('y-axis strikes are not monotonically descending');
+
+  return {
+    ok: issues.length === 0,
+    issues,
+    summary: {
+      date: payload.date,
+      xBuckets: x.length,
+      strikes: y.length,
+      sessionMarkers: payload.sessionMarkers?.length || 0,
+      days: payload.dates?.length || payload.daySegments?.length || 1,
+      spot: payload.spot,
+      limits: payload.limits,
+    },
+  };
+}
+
+export function summarizeConfluence(payload: ChartPayload) {
+  const x = payload.heatmapTrace?.x || [];
+  const y = payload.heatmapTrace?.y || [];
+  const z = payload.heatmapTrace?.z || [];
+  const latestIndex = payload.daySegments?.length
+    ? payload.daySegments[payload.daySegments.length - 1].end
+    : x.length - 1;
+  const spot = payload.spot;
+  const nodes = y.map((strike, rowIndex) => {
+    const value = z[rowIndex]?.[latestIndex] || 0;
+    return { strike, value, abs: Math.abs(value) };
+  }).sort((a, b) => b.abs - a.abs);
+  const king = nodes[0] || null;
+  const floor = nodes.filter((node) => node.strike < spot).sort((a, b) => b.abs - a.abs)[0] || null;
+  const ceiling = nodes.filter((node) => node.strike > spot).sort((a, b) => b.abs - a.abs)[0] || null;
+  const upsideMass = nodes.filter((node) => node.strike > spot).reduce((sum, node) => sum + node.abs, 0);
+  const downsideMass = nodes.filter((node) => node.strike < spot).reduce((sum, node) => sum + node.abs, 0);
+  const bias = upsideMass > downsideMass * 1.15
+    ? 'upside'
+    : downsideMass > upsideMass * 1.15
+      ? 'downside'
+      : 'balanced';
+
+  return {
+    date: payload.date,
+    mode: payload.mode || 'gex',
+    spot,
+    king,
+    floor,
+    ceiling,
+    bias,
+    upsideMass,
+    downsideMass,
+  };
+}
+
+function isAuthorizedCron(request: Request, env: Env): boolean {
+  if (!env.ADMIN_SECRET) return false;
+  const url = new URL(request.url);
+  const authHeader = request.headers.get('Authorization') || '';
+  const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : '';
+  const headerSecret = request.headers.get('X-Admin-Secret') || '';
+  const querySecret = url.searchParams.get('secret') || '';
+  return [bearer, headerSecret, querySecret].includes(env.ADMIN_SECRET);
 }
 
 // --- 1. THE DURABLE OBJECT ---
@@ -66,7 +262,9 @@ export class HeatmapBuilderDO implements DurableObject {
 
     if (request.method === 'POST' && url.pathname === '/api/v1/addStrip') {
       const newData = (await request.json()) as NewStripData;
-      const { key } = getStorageKey(newData.ticker, APP_TIMEZONE);
+      const ticker = normalizeTicker(newData.ticker);
+      const mode = normalizeMode(newData.mode || 'gex');
+      const { key } = getStorageKey(ticker, APP_TIMEZONE, new Date(), mode);
 
       let sessionData: SessionData = (await this.state.storage.get(key)) || {
         y_strikes: newData.futureMap.y_strikes, // Initialize with FIRST strip's strikes
@@ -125,13 +323,24 @@ export class HeatmapBuilderDO implements DurableObject {
     // --- ROUTE B: Get Chart Data (Filtered by Date) ---
     if (request.method === 'GET' && url.pathname === '/api/v1/getChartData') {
       const requestedDate = url.searchParams.get('date'); // YYYY-MM-DD
+      const ticker = normalizeTicker(url.searchParams.get('ticker'));
+      const mode = normalizeMode(url.searchParams.get('mode'));
+      const targetRequestedDate = normalizeDate(requestedDate);
+      const days = normalizeDays(url.searchParams.get('days'));
+      const includeFuture = url.searchParams.get('includeFuture') !== 'false';
 
       // 1. Fetch ALL keys first to find available dates
       // (Optimization: We could list with prefix if we knew the date, 
       // but listing all keys for 3 days of data is very cheap/fast)
       const listMap = await this.state.storage.list<SessionData>({
-        prefix: `data_${TICKER}_`,
+        prefix: storagePrefix(ticker, mode),
       });
+      if (mode === 'gex') {
+        const legacyMap = await this.state.storage.list<SessionData>({
+          prefix: legacyStoragePrefix(ticker),
+        });
+        for (const [key, value] of legacyMap) listMap.set(key, value);
+      }
 
       if (listMap.size === 0) {
         return new Response(JSON.stringify({ error: 'No data available' }), { status: 404 });
@@ -140,72 +349,104 @@ export class HeatmapBuilderDO implements DurableObject {
       // 2. Determine which date to show
       // Extract unique dates from keys: data_SPY_2023-10-25_mkt_open
       const allKeys = Array.from(listMap.keys()).sort();
-      const uniqueDates = [...new Set(allKeys.map(k => k.split('_')[2]))];
+      const uniqueDates = [...new Set(allKeys.map(k => getDateFromStorageKey(k, ticker, mode)).filter(Boolean) as string[])].sort();
 
-      // Default to the LATEST date if none provided
-      const targetDate = requestedDate || uniqueDates[uniqueDates.length - 1];
+      // Default to the latest available date, then include the requested trailing window.
+      const endDate = targetRequestedDate || uniqueDates[uniqueDates.length - 1];
+      const endDateIndex = uniqueDates.indexOf(endDate);
+      if (endDateIndex === -1) {
+        return new Response(JSON.stringify({ error: 'No data for date' }), { status: 404 });
+      }
+      const targetDates = uniqueDates.slice(Math.max(0, endDateIndex - days + 1), endDateIndex + 1);
 
-      // 3. Filter keys for that specific date
-      const keysForDate = allKeys.filter(k => k.includes(targetDate));
+      // 3. Filter keys for the requested date window
+      const keysForWindow = allKeys.filter((key) =>
+        targetDates.some((date) => keyMatchesDate(key, ticker, mode, date))
+      );
 
-      if (keysForDate.length === 0) {
+      if (keysForWindow.length === 0) {
         return new Response(JSON.stringify({ error: 'No data for date' }), { status: 404 });
       }
 
+      const y_strikes = Array.from(new Set(
+        keysForWindow.flatMap((key) => listMap.get(key)?.y_strikes || [])
+      )).sort((a, b) => b - a);
+
       const combined_x_mte: number[] = [];
-      const combined_z_values: number[][] = [];
-      const sessionMarkers: { x: number; label: string }[] = [];
+      const combined_z_values: number[][] = y_strikes.map(() => []);
+      const sessionMarkers: { x: number; label: string; date?: string }[] = [];
+      const daySegments: { date: string; start: number; end: number }[] = [];
 
       let lastKnownSpot = 0;
       let lastKnownLimits = { up: 0, down: 0 };
-      let y_strikes: number[] = [];
-      let latestSession: SessionData | null = null;
+      let latestSession: { date: string; data: SessionData } | null = null;
 
-      // 4. Stitch sessions (Only for the target date)
-      for (const key of keysForDate) {
-        const sessionData = listMap.get(key);
-        if (!sessionData || !sessionData.mtes) continue;
+      // 4. Stitch sessions, preserving day boundaries for the table renderer.
+      for (const date of targetDates) {
+        const dayStart = combined_x_mte.length;
+        const keysForDate = allKeys.filter((key) => keyMatchesDate(key, ticker, mode, date));
 
-        const sessionName = key.split('_').pop() || 'session';
+        for (const key of keysForDate) {
+          const sessionData = listMap.get(key);
+          if (!sessionData || !sessionData.mtes) continue;
 
-        // Only add marker if we are appending a second session (e.g. post-market)
-        if (combined_x_mte.length > 0) {
-          sessionMarkers.push({
-            x: combined_x_mte[combined_x_mte.length - 1],
-            label: sessionName,
-          });
-        }
+          const sessionName = key.split('_').pop() || 'session';
 
-        if (combined_z_values.length === 0) {
-          y_strikes = sessionData.y_strikes;
-          for (let i = 0; i < y_strikes.length; i++) combined_z_values.push([]);
-        }
-
-        combined_x_mte.push(...sessionData.mtes);
-
-        for (let i = 0; i < y_strikes.length; i++) {
-          for (const strip of sessionData.strips) {
-            combined_z_values[i].push(strip[i] || 0);
+          // Only add marker if we are appending a second session or day.
+          if (combined_x_mte.length > 0) {
+            sessionMarkers.push({
+              x: combined_x_mte[combined_x_mte.length - 1],
+              label: sessionName,
+              date,
+            });
           }
+
+          const historicalPairs = sessionData.mtes
+            .map((mte, index) => ({ mte, strip: sessionData.strips[index] }))
+            .filter((pair) => pair.strip)
+            .sort((a, b) => b.mte - a.mte);
+
+          combined_x_mte.push(...historicalPairs.map((pair) => pair.mte));
+
+          for (let i = 0; i < y_strikes.length; i++) {
+            const strike = y_strikes[i];
+            const sessionStrikeIndex = sessionData.y_strikes.indexOf(strike);
+            for (const { strip } of historicalPairs) {
+              combined_z_values[i].push(sessionStrikeIndex === -1 ? 0 : strip[sessionStrikeIndex] || 0);
+            }
+          }
+          latestSession = { date, data: sessionData };
         }
-        latestSession = sessionData;
+
+        if (combined_x_mte.length > dayStart) {
+          daySegments.push({ date, start: dayStart, end: combined_x_mte.length - 1 });
+        }
       }
 
-      // 5. Append Future (only if viewing TODAY/Latest)
-      // If viewing a past date, we theoretically only want historical data.
-      // But for simplicity, if it's the latest session of that day, we show its future projection.
-      if (latestSession && latestSession.future_x_mte && latestSession.future_x_mte.length > 0) {
-        combined_x_mte.push(...latestSession.future_x_mte);
+      if (latestSession) {
+        lastKnownSpot = latestSession.data.spot;
+        lastKnownLimits = latestSession.data.limits;
+      }
+
+      // 5. Append future projection only to the final selected day when requested.
+      if (includeFuture && latestSession && latestSession.data.future_x_mte && latestSession.data.future_x_mte.length > 0) {
+        const activeSegment = daySegments[daySegments.length - 1];
+        combined_x_mte.push(...latestSession.data.future_x_mte);
         for (let i = 0; i < y_strikes.length; i++) {
-          const futureRow = latestSession.future_z_values[i] || [];
-          combined_z_values[i].push(...futureRow);
+          const strike = y_strikes[i];
+          const sessionStrikeIndex = latestSession.data.y_strikes.indexOf(strike);
+          const futureRow = sessionStrikeIndex === -1 ? [] : latestSession.data.future_z_values[sessionStrikeIndex] || [];
+          combined_z_values[i].push(...latestSession.data.future_x_mte.map((_, index) => futureRow[index] || 0));
         }
-        lastKnownSpot = latestSession.spot;
-        lastKnownLimits = latestSession.limits;
+        if (activeSegment && latestSession.date === activeSegment.date) {
+          activeSegment.end = combined_x_mte.length - 1;
+        }
       }
 
       const payload = {
-        date: targetDate,
+        date: endDate,
+        dates: targetDates,
+        mode,
         heatmapTrace: {
           type: 'heatmap',
           x: combined_x_mte,
@@ -218,6 +459,7 @@ export class HeatmapBuilderDO implements DurableObject {
         limits: lastKnownLimits,
         spot: lastKnownSpot,
         sessionMarkers: sessionMarkers,
+        daySegments,
       };
 
       return new Response(JSON.stringify(payload), {
@@ -227,10 +469,16 @@ export class HeatmapBuilderDO implements DurableObject {
 
     // --- ROUTE E: Get Available Dates (For Dropdown) ---
     if (request.method === 'GET' && url.pathname === '/api/v1/getAvailableDates') {
-      const listMap = await this.state.storage.list({ prefix: `data_${TICKER}_` });
+      const ticker = normalizeTicker(url.searchParams.get('ticker'));
+      const mode = normalizeMode(url.searchParams.get('mode'));
+      const listMap = await this.state.storage.list({ prefix: storagePrefix(ticker, mode) });
+      if (mode === 'gex') {
+        const legacyMap = await this.state.storage.list({ prefix: legacyStoragePrefix(ticker) });
+        for (const [key, value] of legacyMap) listMap.set(key, value);
+      }
       const allKeys = Array.from(listMap.keys());
       // Extract "2023-10-25" from "data_SPY_2023-10-25_mkt_open"
-      const uniqueDates = [...new Set(allKeys.map(k => k.split('_')[2]))].sort();
+      const uniqueDates = [...new Set(allKeys.map(k => getDateFromStorageKey(k, ticker, mode)).filter(Boolean) as string[])].sort();
 
       return new Response(JSON.stringify(uniqueDates), {
         headers: { 'Content-Type': 'application/json' },
@@ -271,7 +519,7 @@ export class HeatmapBuilderDO implements DurableObject {
 // --- 2. THE WORKER ---
 export interface Env {
   GEX_HISTORY_DO: DurableObjectNamespace;
-  ADMIN_SECRET: string; // <--- NEW SECRET
+  ADMIN_SECRET: string;
 }
 
 const ALLOWED_ORIGIN = "https://1001encore.github.io";
@@ -289,7 +537,7 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Admin-Secret",
         },
       });
     }
@@ -298,35 +546,116 @@ export default {
 
     try {
       if (url.pathname === '/__cron') {
+        if (!isAuthorizedCron(request, env)) {
+          return addCORSHeaders(new Response('Unauthorized', { status: 401 }));
+        }
         await this.scheduled(null, env, ctx);
-        return new Response('Cron Ran');
+        return addCORSHeaders(new Response('Cron Ran'));
       }
 
       if (url.pathname === '/api/get-gamma-api') {
-        const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
-        const requestedDate = url.searchParams.get('date'); // New Param
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const mode = normalizeMode(url.searchParams.get('mode'));
+        const requestedDate = normalizeDate(url.searchParams.get('date'));
+        const days = normalizeDays(url.searchParams.get('days'));
 
         const doId = env.GEX_HISTORY_DO.idFromName(ticker);
         const stub = env.GEX_HISTORY_DO.get(doId);
 
         // Pass the date query to the DO
-        let doUrl = 'https://dummy/api/v1/getChartData';
-        if (requestedDate) doUrl += `?date=${requestedDate}`;
+        const includeFuture = url.searchParams.get('includeFuture');
+        let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}`;
+        if (requestedDate) doUrl += `&date=${requestedDate}`;
+        if (includeFuture === 'false') doUrl += '&includeFuture=false';
 
         return addCORSHeaders(await stub.fetch(doUrl));
       }
 
-      // --- NEW: Expose Available Dates to Frontend ---
-      if (url.pathname === '/api/get-dates') {
-        const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
+      if (url.pathname === '/api/diagnostics') {
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const mode = normalizeMode(url.searchParams.get('mode'));
+        const requestedDate = normalizeDate(url.searchParams.get('date'));
+        const days = normalizeDays(url.searchParams.get('days'));
+
         const doId = env.GEX_HISTORY_DO.idFromName(ticker);
         const stub = env.GEX_HISTORY_DO.get(doId);
-        return addCORSHeaders(await stub.fetch('https://dummy/api/v1/getAvailableDates'));
+        let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}`;
+        if (requestedDate) doUrl += `&date=${requestedDate}`;
+
+        const chartResponse = await stub.fetch(doUrl);
+        if (!chartResponse.ok) return addCORSHeaders(chartResponse);
+
+        const payload = (await chartResponse.json()) as ChartPayload;
+        return addCORSHeaders(new Response(JSON.stringify(validateChartPayload(payload)), {
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+
+      // --- Expose Available Dates to Frontend ---
+      if (url.pathname === '/api/get-dates') {
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const mode = normalizeMode(url.searchParams.get('mode'));
+        const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+        const stub = env.GEX_HISTORY_DO.get(doId);
+        return addCORSHeaders(await stub.fetch(`https://dummy/api/v1/getAvailableDates?ticker=${encodeURIComponent(ticker)}&mode=${mode}`));
+      }
+
+      if (url.pathname === '/api/confluence') {
+        const mode = normalizeMode(url.searchParams.get('mode'));
+        const requestedDate = normalizeDate(url.searchParams.get('date'));
+        const days = normalizeDays(url.searchParams.get('days'));
+        const tickers = (url.searchParams.get('tickers') || 'SPY,QQQ,^SPX')
+          .split(',')
+          .map((ticker) => normalizeTicker(ticker))
+          .slice(0, 5);
+
+        const results = await Promise.all(tickers.map(async (ticker) => {
+          const doId = env.GEX_HISTORY_DO.idFromName(ticker);
+          const stub = env.GEX_HISTORY_DO.get(doId);
+          let doUrl = `https://dummy/api/v1/getChartData?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${days}&includeFuture=false`;
+          if (requestedDate) doUrl += `&date=${requestedDate}`;
+          const response = await stub.fetch(doUrl);
+          if (!response.ok) return { ticker, ok: false, error: await response.text() };
+          const payload = (await response.json()) as ChartPayload;
+          return { ticker, ok: true, summary: summarizeConfluence(payload) };
+        }));
+
+        return addCORSHeaders(new Response(JSON.stringify({ mode, tickers: results }), {
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+
+      if (url.pathname === '/api/live-exposure') {
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const mode = normalizeMode(url.searchParams.get('mode'));
+        const expirations = normalizeExpirations(url.searchParams.get('expirations'));
+        const { mkt_hours, mins_passed } = getMarketStatus(APP_TIMEZONE);
+        const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
+        const { df, spot } = await calc_exposure(ticker, mte_list, { mode, expirations });
+        const { limit_up, limit_down } = getChartLimits(df, mte_len);
+        const payload: ChartPayload = {
+          date: getDateStr(0, APP_TIMEZONE),
+          dates: [getDateStr(0, APP_TIMEZONE)],
+          mode,
+          heatmapTrace: {
+            x: df.columns,
+            y: df.index,
+            z: df.values,
+          },
+          limits: { up: limit_up, down: limit_down },
+          spot,
+          sessionMarkers: [],
+          daySegments: [{ date: getDateStr(0, APP_TIMEZONE), start: 0, end: df.columns.length - 1 }],
+        };
+
+        return addCORSHeaders(new Response(JSON.stringify(payload), {
+          headers: { 'Content-Type': 'application/json' },
+        }));
       }
 
       if (url.pathname === '/api/get-ohlc') {
-        const ticker = url.searchParams.get('ticker')?.toUpperCase() || TICKER;
-        const interval = url.searchParams.get('interval') || '5m';
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const interval = normalizeInterval(url.searchParams.get('interval'));
         const { mkt_hours } = getMarketStatus(APP_TIMEZONE);
         const { ohlc, mktHoursRange } = await makeCS(ticker, interval, mkt_hours);
 
@@ -370,44 +699,47 @@ export default {
     if (mkt_hours !== 'mkt_open') return;
 
     const { mte_list, mte_len } = getMteList(mkt_hours, mins_passed);
-    const { df, spot } = await calc_gamma(TICKER, mte_list);
-    const { limit_up, limit_down } = getChartLimits(df, mte_len);
-
     const current_bucket_mins = Math.floor(mins_passed);
     const target_mte = 390 - current_bucket_mins;
 
-    const splitIndex = df.columns.indexOf(target_mte);
-    if (splitIndex === -1) {
-      console.log(`Target MTE ${target_mte} not found in grid.`);
-      return;
+    for (const mode of ['gex', 'vex'] as ExposureMode[]) {
+      const { df, spot } = await calc_exposure(TICKER, mte_list, { mode, expirations: 3 });
+      const { limit_up, limit_down } = getChartLimits(df, mte_len);
+
+      const splitIndex = df.columns.indexOf(target_mte);
+      if (splitIndex === -1) {
+        console.log(`Target MTE ${target_mte} not found in ${mode} grid.`);
+        continue;
+      }
+
+      const historical_z_strip = df.values.map(row => row[splitIndex]);
+      const future_columns = df.columns.slice(splitIndex + 1);
+      const future_z_values = df.values.map(row => row.slice(splitIndex + 1));
+
+      const stripData: NewStripData = {
+        ticker: TICKER,
+        mode,
+        historicalStrip: {
+          x_mte: target_mte,
+          z_strip: historical_z_strip,
+        },
+        futureMap: {
+          x_mte: future_columns,
+          y_strikes: df.index,
+          z_values: future_z_values,
+        },
+        limits: { up: limit_up, down: limit_down },
+        spot: spot,
+      };
+
+      const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
+      const stub = env.GEX_HISTORY_DO.get(doId);
+
+      ctx.waitUntil(stub.fetch('https://dummy/api/v1/addStrip', {
+        method: 'POST',
+        body: JSON.stringify(stripData),
+        headers: { 'Content-Type': 'application/json' },
+      }));
     }
-
-    const historical_z_strip = df.values.map(row => row[splitIndex]);
-    const future_columns = df.columns.slice(splitIndex + 1);
-    const future_z_values = df.values.map(row => row.slice(splitIndex + 1));
-
-    const stripData: NewStripData = {
-      ticker: TICKER,
-      historicalStrip: {
-        x_mte: target_mte,
-        z_strip: historical_z_strip,
-      },
-      futureMap: {
-        x_mte: future_columns,
-        y_strikes: df.index,
-        z_values: future_z_values,
-      },
-      limits: { up: limit_up, down: limit_down },
-      spot: spot,
-    };
-
-    const doId = env.GEX_HISTORY_DO.idFromName(TICKER);
-    const stub = env.GEX_HISTORY_DO.get(doId);
-
-    ctx.waitUntil(stub.fetch('https://dummy/api/v1/addStrip', {
-      method: 'POST',
-      body: JSON.stringify(stripData),
-      headers: { 'Content-Type': 'application/json' },
-    }));
   },
 };
