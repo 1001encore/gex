@@ -154,6 +154,7 @@ async function calc_exposure(ticker, mte_list, options = {}) {
   const mode = options.mode || "gex";
   const expirationCount = Math.max(1, Math.min(12, options.expirations || 3));
   const now = options.now || /* @__PURE__ */ new Date();
+  const sizeModel = options.sizeModel || "weighted";
   const { cookie, crumb } = await getYahooAuth();
   const authedHeaders = { ...YF_HEADERS, Cookie: cookie };
   const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=5m&crumb=${crumb}`;
@@ -210,8 +211,8 @@ async function calc_exposure(ticker, mte_list, options = {}) {
       for (let i = 0; i < mte_list.length; i++) {
         const projectedMinutesElapsed = 390 - mte_list[i];
         const minutesToExpiration = getMinutesToExpiration(expiration, now, projectedMinutesElapsed);
-        const callValue = call ? calcContractExposure(mode, "call", spot, K, minutesToExpiration, call) : 0;
-        const putValue = put ? calcContractExposure(mode, "put", spot, K, minutesToExpiration, put) : 0;
+        const callValue = call ? calcContractExposure(mode, "call", spot, K, minutesToExpiration, call, sizeModel, isSameExpiryDate(expiration, now)) : 0;
+        const putValue = put ? calcContractExposure(mode, "put", spot, K, minutesToExpiration, put, sizeModel, isSameExpiryDate(expiration, now)) : 0;
         exposureByStrike[K][i] += callValue + putValue;
       }
     }
@@ -230,6 +231,7 @@ async function calc_expiry_matrix(ticker, options = {}) {
   const mode = options.mode || "gex";
   const expirationCount = Math.max(1, Math.min(30, options.expirations || 3));
   const now = options.now || /* @__PURE__ */ new Date();
+  const sizeModel = options.sizeModel || "intraday";
   const { cookie, crumb } = await getYahooAuth();
   const authedHeaders = { ...YF_HEADERS, Cookie: cookie };
   const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=5m&crumb=${crumb}`;
@@ -278,7 +280,9 @@ async function calc_expiry_matrix(ticker, options = {}) {
         spot,
         contract.strike,
         getMinutesToExpiration(expiration, now, 0),
-        contract
+        contract,
+        sizeModel,
+        isSameExpiryDate(expiration, now)
       );
     }
     for (const contract of chain.puts) {
@@ -289,7 +293,9 @@ async function calc_expiry_matrix(ticker, options = {}) {
         spot,
         contract.strike,
         getMinutesToExpiration(expiration, now, 0),
-        contract
+        contract,
+        sizeModel,
+        isSameExpiryDate(expiration, now)
       );
     }
   }
@@ -314,16 +320,73 @@ async function calc_expiry_matrix(ticker, options = {}) {
     columnMeta
   };
 }
+async function get_chain_diagnostics(ticker, options = {}) {
+  const expirationCount = Math.max(1, Math.min(30, options.expirations || 3));
+  const sizeModel = options.sizeModel || "intraday";
+  const now = options.now || /* @__PURE__ */ new Date();
+  const { cookie, crumb } = await getYahooAuth();
+  const authedHeaders = { ...YF_HEADERS, Cookie: cookie };
+  const optionsUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?crumb=${crumb}`;
+  const optionsRes = await fetch(optionsUrl, { headers: authedHeaders });
+  if (!optionsRes.ok) {
+    if (optionsRes.status === 401 || optionsRes.status === 403) yahooAuth.expiry = 0;
+    throw new Error(`Failed to fetch options dates: ${optionsRes.status}`);
+  }
+  const optionsJson = await optionsRes.json();
+  const expirationDates = optionsJson?.optionChain?.result?.[0]?.expirationDates?.slice(0, expirationCount) || [];
+  const expirations = [];
+  for (const expiration of expirationDates) {
+    const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${expiration}&crumb=${crumb}`;
+    const chainRes = await fetch(chainUrl, { headers: authedHeaders });
+    if (!chainRes.ok) {
+      if (chainRes.status === 401 || chainRes.status === 403) yahooAuth.expiry = 0;
+      throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
+    }
+    const chainJson = await chainRes.json();
+    const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
+    if (!chain || !chain.calls || !chain.puts) {
+      throw new Error(`Could not fetch options chain for ${ticker}`);
+    }
+    const contracts = [...chain.calls, ...chain.puts];
+    const sameDay = isSameExpiryDate(expiration, now);
+    expirations.push({
+      date: new Date(expiration * 1e3).toISOString().slice(0, 10),
+      isSameDayExpiry: sameDay,
+      calls: chain.calls.length,
+      puts: chain.puts.length,
+      callOpenInterest: sumContracts(chain.calls, "openInterest"),
+      putOpenInterest: sumContracts(chain.puts, "openInterest"),
+      callVolume: sumContracts(chain.calls, "volume"),
+      putVolume: sumContracts(chain.puts, "volume"),
+      nonzeroOiContracts: contracts.filter((contract) => Number(contract.openInterest || 0) > 0).length,
+      nonzeroVolumeContracts: contracts.filter((contract) => Number(contract.volume || 0) > 0).length,
+      estimatedSize: contracts.reduce((sum, contract) => sum + getContractSize(contract, sizeModel, sameDay), 0)
+    });
+  }
+  return { ticker, sizeModel, expirations };
+}
+function sumContracts(contracts, key) {
+  return contracts.reduce((sum, contract) => sum + Number(contract[key] || 0), 0);
+}
 function getMinutesToExpiration(expirationTimestampSeconds, now, projectedMinutesElapsed) {
   const expirationMs = expirationTimestampSeconds * 1e3;
   const projectedNowMs = now.getTime() + projectedMinutesElapsed * 6e4;
   return Math.max(1, (expirationMs - projectedNowMs) / 6e4);
 }
-function calcContractExposure(mode, type, S, K, minutesToExpiration, contract) {
-  const sigma = Number(contract.impliedVolatility) > 0 ? Number(contract.impliedVolatility) : 0.2;
+function isSameExpiryDate(expirationTimestampSeconds, now) {
+  return new Date(expirationTimestampSeconds * 1e3).toISOString().slice(0, 10) === now.toISOString().slice(0, 10);
+}
+function getContractSize(contract, sizeModel, isSameDayExpiry) {
   const openInterest = Number(contract.openInterest || 0);
   const volume = Number(contract.volume || 0);
-  const contractCount = openInterest + volume * 0.25;
+  if (sizeModel === "conservative") return openInterest;
+  if (sizeModel === "intraday" && isSameDayExpiry) return Math.max(openInterest, volume);
+  if (sizeModel === "intraday") return openInterest + volume * 0.25;
+  return openInterest + volume * 0.25;
+}
+function calcContractExposure(mode, type, S, K, minutesToExpiration, contract, sizeModel = "weighted", isSameDayExpiry = false) {
+  const sigma = Number(contract.impliedVolatility) > 0 ? Number(contract.impliedVolatility) : 0.2;
+  const contractCount = getContractSize(contract, sizeModel, isSameDayExpiry);
   if (!contractCount) return 0;
   const sign = type === "call" ? 1 : -1;
   if (mode === "vex") {
@@ -503,6 +566,13 @@ function normalizeMode(input) {
     throw new Error("Invalid mode");
   }
   return mode;
+}
+function normalizeSizeModel(input) {
+  const sizeModel = (input || "intraday").toLowerCase();
+  if (sizeModel !== "conservative" && sizeModel !== "weighted" && sizeModel !== "intraday") {
+    throw new Error("Invalid size model");
+  }
+  return sizeModel;
 }
 function storagePrefix(ticker, mode) {
   return `data_${mode}_${ticker}_`;
@@ -939,8 +1009,18 @@ var index_default = {
         const ticker = normalizeTicker(url.searchParams.get("ticker"));
         const mode = normalizeMode(url.searchParams.get("mode"));
         const expirations = normalizeExpirations(url.searchParams.get("horizon"));
-        const matrix = await calc_expiry_matrix(ticker, { mode, expirations });
+        const sizeModel = normalizeSizeModel(url.searchParams.get("sizeModel"));
+        const matrix = await calc_expiry_matrix(ticker, { mode, expirations, sizeModel });
         return addCORSHeaders(new Response(JSON.stringify({ ...matrix, source: "future" }), {
+          headers: { "Content-Type": "application/json" }
+        }));
+      }
+      if (url.pathname === "/api/chain-diagnostics") {
+        const ticker = normalizeTicker(url.searchParams.get("ticker"));
+        const expirations = normalizeExpirations(url.searchParams.get("horizon"));
+        const sizeModel = normalizeSizeModel(url.searchParams.get("sizeModel"));
+        const diagnostics = await get_chain_diagnostics(ticker, { expirations, sizeModel });
+        return addCORSHeaders(new Response(JSON.stringify(diagnostics), {
           headers: { "Content-Type": "application/json" }
         }));
       }
@@ -1068,6 +1148,7 @@ export {
   normalizeExpirations,
   normalizeInterval,
   normalizeMode,
+  normalizeSizeModel,
   normalizeTicker,
   summarizeConfluence,
   validateChartPayload

@@ -920,7 +920,7 @@
             const viewMode = getViewMode();
             const date = dateSelect.value;
             const url = viewMode === 'future'
-                ? `${WORKER_URL}/api/future-matrix?ticker=${encodeURIComponent(ticker)}&mode=${mode}&horizon=${horizon}`
+                ? `${WORKER_URL}/api/future-matrix?ticker=${encodeURIComponent(ticker)}&mode=${mode}&horizon=${horizon}&sizeModel=intraday`
                 : `${WORKER_URL}/api/history-matrix?ticker=${encodeURIComponent(ticker)}&mode=${mode}&days=${horizon}${date && date !== 'LIVE' ? `&date=${encodeURIComponent(date)}` : ''}`;
             try {
                 const matrix = await fetchJson(url);

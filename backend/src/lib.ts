@@ -234,11 +234,13 @@ export interface GammaDf {
 }
 
 export type ExposureMode = 'gex' | 'vex';
+export type SizeModel = 'conservative' | 'weighted' | 'intraday';
 
 export interface ExposureOptions {
   mode?: ExposureMode;
   expirations?: number;
   now?: Date;
+  sizeModel?: SizeModel;
 }
 
 export interface ExposureMatrix {
@@ -249,6 +251,24 @@ export interface ExposureMatrix {
   columns: string[];
   values: number[][];
   columnMeta?: { column: string; hasSizeData: boolean; totalAbs: number }[];
+}
+
+export interface ChainDiagnostics {
+  ticker: string;
+  sizeModel: SizeModel;
+  expirations: Array<{
+    date: string;
+    isSameDayExpiry: boolean;
+    calls: number;
+    puts: number;
+    callOpenInterest: number;
+    putOpenInterest: number;
+    callVolume: number;
+    putVolume: number;
+    nonzeroOiContracts: number;
+    nonzeroVolumeContracts: number;
+    estimatedSize: number;
+  }>;
 }
 
 export async function calc_gamma(
@@ -267,6 +287,7 @@ export async function calc_exposure(
   const mode = options.mode || 'gex';
   const expirationCount = Math.max(1, Math.min(12, options.expirations || 3));
   const now = options.now || new Date();
+  const sizeModel = options.sizeModel || 'weighted';
   const { cookie, crumb } = await getYahooAuth();
   const authedHeaders = { ...YF_HEADERS, Cookie: cookie! };
   const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1d&interval=5m&crumb=${crumb}`;
@@ -331,8 +352,8 @@ export async function calc_exposure(
       for (let i = 0; i < mte_list.length; i++) {
         const projectedMinutesElapsed = 390 - mte_list[i];
         const minutesToExpiration = getMinutesToExpiration(expiration, now, projectedMinutesElapsed);
-        const callValue = call ? calcContractExposure(mode, 'call', spot, K, minutesToExpiration, call) : 0;
-        const putValue = put ? calcContractExposure(mode, 'put', spot, K, minutesToExpiration, put) : 0;
+        const callValue = call ? calcContractExposure(mode, 'call', spot, K, minutesToExpiration, call, sizeModel, isSameExpiryDate(expiration, now)) : 0;
+        const putValue = put ? calcContractExposure(mode, 'put', spot, K, minutesToExpiration, put, sizeModel, isSameExpiryDate(expiration, now)) : 0;
         exposureByStrike[K][i] += callValue + putValue;
       }
     }
@@ -356,6 +377,7 @@ export async function calc_expiry_matrix(
   const mode = options.mode || 'gex';
   const expirationCount = Math.max(1, Math.min(30, options.expirations || 3));
   const now = options.now || new Date();
+  const sizeModel = options.sizeModel || 'intraday';
   const { cookie, crumb } = await getYahooAuth();
   const authedHeaders = { ...YF_HEADERS, Cookie: cookie! };
 
@@ -411,7 +433,9 @@ export async function calc_expiry_matrix(
         spot,
         contract.strike,
         getMinutesToExpiration(expiration, now, 0),
-        contract
+        contract,
+        sizeModel,
+        isSameExpiryDate(expiration, now)
       );
     }
     for (const contract of chain.puts) {
@@ -422,7 +446,9 @@ export async function calc_expiry_matrix(
         spot,
         contract.strike,
         getMinutesToExpiration(expiration, now, 0),
-        contract
+        contract,
+        sizeModel,
+        isSameExpiryDate(expiration, now)
       );
     }
   }
@@ -450,10 +476,80 @@ export async function calc_expiry_matrix(
   };
 }
 
+export async function get_chain_diagnostics(
+  ticker: string,
+  options: ExposureOptions = {}
+): Promise<ChainDiagnostics> {
+  const expirationCount = Math.max(1, Math.min(30, options.expirations || 3));
+  const sizeModel = options.sizeModel || 'intraday';
+  const now = options.now || new Date();
+  const { cookie, crumb } = await getYahooAuth();
+  const authedHeaders = { ...YF_HEADERS, Cookie: cookie! };
+  const optionsUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?crumb=${crumb}`;
+  const optionsRes = await fetch(optionsUrl, { headers: authedHeaders });
+  if (!optionsRes.ok) {
+    if (optionsRes.status === 401 || optionsRes.status === 403) yahooAuth.expiry = 0;
+    throw new Error(`Failed to fetch options dates: ${optionsRes.status}`);
+  }
+  const optionsJson = (await optionsRes.json()) as any;
+  const expirationDates: number[] =
+    optionsJson?.optionChain?.result?.[0]?.expirationDates?.slice(0, expirationCount) || [];
+
+  const expirations = [];
+  for (const expiration of expirationDates) {
+    const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${expiration}&crumb=${crumb}`;
+    const chainRes = await fetch(chainUrl, { headers: authedHeaders });
+    if (!chainRes.ok) {
+      if (chainRes.status === 401 || chainRes.status === 403) yahooAuth.expiry = 0;
+      throw new Error(`Failed to fetch options chain: ${chainRes.status}`);
+    }
+    const chainJson = (await chainRes.json()) as any;
+    const chain = chainJson?.optionChain?.result?.[0]?.options?.[0];
+    if (!chain || !chain.calls || !chain.puts) {
+      throw new Error(`Could not fetch options chain for ${ticker}`);
+    }
+    const contracts = [...chain.calls, ...chain.puts];
+    const sameDay = isSameExpiryDate(expiration, now);
+    expirations.push({
+      date: new Date(expiration * 1000).toISOString().slice(0, 10),
+      isSameDayExpiry: sameDay,
+      calls: chain.calls.length,
+      puts: chain.puts.length,
+      callOpenInterest: sumContracts(chain.calls, 'openInterest'),
+      putOpenInterest: sumContracts(chain.puts, 'openInterest'),
+      callVolume: sumContracts(chain.calls, 'volume'),
+      putVolume: sumContracts(chain.puts, 'volume'),
+      nonzeroOiContracts: contracts.filter((contract) => Number(contract.openInterest || 0) > 0).length,
+      nonzeroVolumeContracts: contracts.filter((contract) => Number(contract.volume || 0) > 0).length,
+      estimatedSize: contracts.reduce((sum, contract) => sum + getContractSize(contract, sizeModel, sameDay), 0),
+    });
+  }
+
+  return { ticker, sizeModel, expirations };
+}
+
+function sumContracts(contracts: any[], key: 'openInterest' | 'volume'): number {
+  return contracts.reduce((sum, contract) => sum + Number(contract[key] || 0), 0);
+}
+
 function getMinutesToExpiration(expirationTimestampSeconds: number, now: Date, projectedMinutesElapsed: number): number {
   const expirationMs = expirationTimestampSeconds * 1000;
   const projectedNowMs = now.getTime() + projectedMinutesElapsed * 60_000;
   return Math.max(1, (expirationMs - projectedNowMs) / 60_000);
+}
+
+function isSameExpiryDate(expirationTimestampSeconds: number, now: Date): boolean {
+  return new Date(expirationTimestampSeconds * 1000).toISOString().slice(0, 10) === now.toISOString().slice(0, 10);
+}
+
+function getContractSize(contract: any, sizeModel: SizeModel, isSameDayExpiry: boolean): number {
+  const openInterest = Number(contract.openInterest || 0);
+  const volume = Number(contract.volume || 0);
+
+  if (sizeModel === 'conservative') return openInterest;
+  if (sizeModel === 'intraday' && isSameDayExpiry) return Math.max(openInterest, volume);
+  if (sizeModel === 'intraday') return openInterest + volume * 0.25;
+  return openInterest + volume * 0.25;
 }
 
 function calcContractExposure(
@@ -462,12 +558,12 @@ function calcContractExposure(
   S: number,
   K: number,
   minutesToExpiration: number,
-  contract: any
+  contract: any,
+  sizeModel: SizeModel = 'weighted',
+  isSameDayExpiry = false
 ): number {
   const sigma = Number(contract.impliedVolatility) > 0 ? Number(contract.impliedVolatility) : 0.2;
-  const openInterest = Number(contract.openInterest || 0);
-  const volume = Number(contract.volume || 0);
-  const contractCount = openInterest + volume * 0.25;
+  const contractCount = getContractSize(contract, sizeModel, isSameDayExpiry);
   if (!contractCount) return 0;
 
   const sign = type === 'call' ? 1 : -1;

@@ -6,6 +6,7 @@ import {
   normalizeExpirations,
   normalizeInterval,
   normalizeMode,
+  normalizeSizeModel,
   normalizeTicker,
   validateChartPayload,
 } from '../src/index';
@@ -76,6 +77,8 @@ test('request normalizers accept expected values', () => {
   assert.equal(normalizeDays('3'), 3);
   assert.equal(normalizeExpirations('6'), 6);
   assert.equal(normalizeMode('VEX'), 'vex');
+  assert.equal(normalizeSizeModel(null), 'intraday');
+  assert.equal(normalizeSizeModel('weighted'), 'weighted');
   assert.equal(normalizeInterval('15m'), '15m');
   assert.equal(normalizeDate('2026-06-08'), '2026-06-08');
 });
@@ -87,6 +90,7 @@ test('request normalizers reject malformed values', () => {
   assert.throws(() => normalizeExpirations('0'), /Invalid expirations/);
   assert.throws(() => normalizeExpirations('31'), /Invalid expirations/);
   assert.throws(() => normalizeMode('delta'), /Invalid mode/);
+  assert.throws(() => normalizeSizeModel('bad'), /Invalid size model/);
   assert.throws(() => normalizeInterval('3m'), /Invalid interval/);
   assert.throws(() => normalizeDate('06-08-2026'), /Invalid date/);
   assert.throws(() => normalizeDate('2026-02-30'), /Invalid date/);

@@ -13,7 +13,9 @@ import {
 import {
   calc_exposure,
   calc_expiry_matrix,
+  get_chain_diagnostics,
   ExposureMode,
+  SizeModel,
   getMteList,
   getMarketStatus,
   getChartLimits,
@@ -121,6 +123,14 @@ export function normalizeMode(input: string | null): ExposureMode {
     throw new Error('Invalid mode');
   }
   return mode;
+}
+
+export function normalizeSizeModel(input: string | null): SizeModel {
+  const sizeModel = (input || 'intraday').toLowerCase();
+  if (sizeModel !== 'conservative' && sizeModel !== 'weighted' && sizeModel !== 'intraday') {
+    throw new Error('Invalid size model');
+  }
+  return sizeModel;
 }
 
 function storagePrefix(ticker: string, mode: ExposureMode): string {
@@ -690,8 +700,19 @@ export default {
         const ticker = normalizeTicker(url.searchParams.get('ticker'));
         const mode = normalizeMode(url.searchParams.get('mode'));
         const expirations = normalizeExpirations(url.searchParams.get('horizon'));
-        const matrix = await calc_expiry_matrix(ticker, { mode, expirations });
+        const sizeModel = normalizeSizeModel(url.searchParams.get('sizeModel'));
+        const matrix = await calc_expiry_matrix(ticker, { mode, expirations, sizeModel });
         return addCORSHeaders(new Response(JSON.stringify({ ...matrix, source: 'future' }), {
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+
+      if (url.pathname === '/api/chain-diagnostics') {
+        const ticker = normalizeTicker(url.searchParams.get('ticker'));
+        const expirations = normalizeExpirations(url.searchParams.get('horizon'));
+        const sizeModel = normalizeSizeModel(url.searchParams.get('sizeModel'));
+        const diagnostics = await get_chain_diagnostics(ticker, { expirations, sizeModel });
+        return addCORSHeaders(new Response(JSON.stringify(diagnostics), {
           headers: { 'Content-Type': 'application/json' },
         }));
       }
