@@ -294,13 +294,24 @@ async function calc_expiry_matrix(ticker, options = {}) {
     }
   }
   const strikes = Array.from(allStrikes).sort((a, b) => b - a);
+  const columns = expirationDates.map((expiration) => new Date(expiration * 1e3).toISOString().slice(0, 10));
+  const values = strikes.map((strike) => (exposureByStrike[strike] || expirationDates.map(() => 0)).map((value) => Math.round(value * 10) / 10));
+  const columnMeta = columns.map((column, columnIndex) => {
+    const totalAbs = values.reduce((sum, row) => sum + Math.abs(row[columnIndex] || 0), 0);
+    return {
+      column,
+      hasSizeData: totalAbs > 0,
+      totalAbs: Math.round(totalAbs * 10) / 10
+    };
+  });
   return {
     ticker,
     mode,
     spot,
     strikes,
-    columns: expirationDates.map((expiration) => new Date(expiration * 1e3).toISOString().slice(0, 10)),
-    values: strikes.map((strike) => (exposureByStrike[strike] || expirationDates.map(() => 0)).map((value) => Math.round(value * 10) / 10))
+    columns,
+    values,
+    columnMeta
   };
 }
 function getMinutesToExpiration(expirationTimestampSeconds, now, projectedMinutesElapsed) {

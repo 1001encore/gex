@@ -312,6 +312,13 @@
         .mte-header {
             min-width: 52px;
         }
+        .mte-header.no-data {
+            color: #6f7d78;
+        }
+        td.no-data {
+            color: #52605b;
+            background: rgba(255, 255, 255, 0.025) !important;
+        }
         .day-start {
             border-left: 2px solid rgba(255, 255, 255, 0.24);
         }
@@ -868,8 +875,11 @@
                 .sort((a, b) => Math.abs(a - spot) - Math.abs(b - spot))[0];
             let html = '<table><thead><tr>';
             html += '<th class="strike-col">Strike</th>';
-            for (const column of matrix.columns) {
-                html += `<th class="mte-header">${column}</th>`;
+            for (let columnIndex = 0; columnIndex < matrix.columns.length; columnIndex++) {
+                const column = matrix.columns[columnIndex];
+                const meta = matrix.columnMeta?.[columnIndex];
+                const noData = meta && !meta.hasSizeData;
+                html += `<th class="mte-header ${noData ? 'no-data' : ''}">${column}${noData ? '<br>no size' : ''}</th>`;
             }
             html += '</tr></thead><tbody>';
 
@@ -878,7 +888,13 @@
                 const row = matrix.values[rowIndex] || [];
                 html += '<tr>';
                 html += `<th class="strike-col ${strike === closestSpotStrike ? 'spot-row' : ''}">${strike}</th>`;
-                for (const value of row) {
+                for (let columnIndex = 0; columnIndex < row.length; columnIndex++) {
+                    const value = row[columnIndex];
+                    const meta = matrix.columnMeta?.[columnIndex];
+                    if (meta && !meta.hasSizeData) {
+                        html += '<td class="no-data">-</td>';
+                        continue;
+                    }
                     const cellClass = value > 0 ? 'cell-pos' : value < 0 ? 'cell-neg' : 'empty';
                     html += `<td class="${cellClass}" style="${getCellStyle(value, maxAbs)}">${formatSigned(value || 0)}</td>`;
                 }

@@ -248,6 +248,7 @@ export interface ExposureMatrix {
   strikes: number[];
   columns: string[];
   values: number[][];
+  columnMeta?: { column: string; hasSizeData: boolean; totalAbs: number }[];
 }
 
 export async function calc_gamma(
@@ -427,13 +428,25 @@ export async function calc_expiry_matrix(
   }
 
   const strikes = Array.from(allStrikes).sort((a, b) => b - a);
+  const columns = expirationDates.map((expiration) => new Date(expiration * 1000).toISOString().slice(0, 10));
+  const values = strikes.map((strike) => (exposureByStrike[strike] || expirationDates.map(() => 0)).map((value) => Math.round(value * 10) / 10));
+  const columnMeta = columns.map((column, columnIndex) => {
+    const totalAbs = values.reduce((sum, row) => sum + Math.abs(row[columnIndex] || 0), 0);
+    return {
+      column,
+      hasSizeData: totalAbs > 0,
+      totalAbs: Math.round(totalAbs * 10) / 10,
+    };
+  });
+
   return {
     ticker,
     mode,
     spot,
     strikes,
-    columns: expirationDates.map((expiration) => new Date(expiration * 1000).toISOString().slice(0, 10)),
-    values: strikes.map((strike) => (exposureByStrike[strike] || expirationDates.map(() => 0)).map((value) => Math.round(value * 10) / 10)),
+    columns,
+    values,
+    columnMeta,
   };
 }
 
